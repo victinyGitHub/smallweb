@@ -91,7 +91,7 @@ class WebGraph:
         # Reconstruct without fragment
         return f"{parsed.scheme}://{parsed.netloc}{path}"
 
-    def pagerank(self, damping: float = 0.85, iterations: int = 50) -> Dict[str, float]:
+    def pagerank(self, damping: float = 0.95, iterations: int = 50) -> Dict[str, float]:
         """
         Compute PageRank over the local graph.
         Returns {url: score} sorted by score descending.
@@ -130,12 +130,19 @@ class WebGraph:
         result = {urls[i]: scores[i] for i in range(n)}
         return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
-    def discoveries(self, top_n: int = 20) -> List[Tuple[str, float, dict]]:
+    def discoveries(self, top_n: int = 20, damping: float = 0.95,
+                     iterations: int = 50) -> List[Tuple[str, float, dict]]:
         """
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
+
+        Args:
+            top_n:      Number of discoveries to return
+            damping:    PageRank damping factor (0.95 = follow links deep,
+                        0.5 = stay close to seeds)
+            iterations: PageRank iterations (50 is usually plenty)
         """
-        ranks = self.pagerank()
+        ranks = self.pagerank(damping=damping, iterations=iterations)
         results = []
         for url, score in ranks.items():
             if url not in self.seeds and url in self.nodes:
@@ -198,8 +205,22 @@ class WebGraph:
 
     # ── Fork & Merge ──
 
-    def fork(self, name: str = "", author: str = "") -> "WebGraph":
-        """Create a copy of this graph (fork it)."""
+    def fork(self, name: str = "", author: str = "",
+             add_seeds: Optional[List[str]] = None,
+             promote_top_n: int = 0) -> "WebGraph":
+        """
+        Create a copy of this graph (fork it), optionally with new seeds.
+
+        Args:
+            name:           Name for the forked graph
+            author:         Author of the fork
+            add_seeds:      Additional URLs to add as seeds in the fork.
+                            Use this to "promote" discovered URLs into seeds
+                            for a deeper re-crawl.
+            promote_top_n:  Auto-promote the top N discoveries to seeds.
+                            e.g. promote_top_n=10 adds the 10 highest-ranked
+                            non-seed pages as seeds in the fork.
+        """
         data = self.to_json()
         forked = WebGraph.from_json(data)
         forked.metadata["forked_from"] = self.metadata.get("name", "unknown")
@@ -209,6 +230,25 @@ class WebGraph:
             forked.metadata["name"] = name
         if author:
             forked.metadata["author"] = author
+
+        # Add explicit seed URLs
+        if add_seeds:
+            for url in add_seeds:
+                if not url.startswith("http"):
+                    url = "https://" + url
+                forked.add_seed(url)
+            forked.metadata["seeds_added"] = add_seeds
+
+        # Auto-promote top discoveries to seeds
+        if promote_top_n > 0:
+            discoveries = self.discoveries(top_n=promote_top_n)
+            promoted = []
+            for url, score, node in discoveries:
+                forked.add_seed(url)
+                promoted.append(url)
+            forked.metadata["seeds_promoted"] = promoted
+            forked.metadata["seeds_promoted_count"] = len(promoted)
+
         return forked
 
     @staticmethod
@@ -664,18 +704,32 @@ def main():
     rank_p = subparsers.add_parser("rank", help="Show PageRank of all pages")
     rank_p.add_argument("graph", help="Graph JSON file")
     rank_p.add_argument("--top", "-n", type=int, default=20, help="Top N results")
+    rank_p.add_argument("--damping", type=float, default=0.95, help="PageRank damping factor (default: 0.95, higher=deeper)")
+    rank_p.add_argument("--iterations", type=int, default=50, help="PageRank iterations (default: 50)")
 
     # discover
     disc_p = subparsers.add_parser("discover", help="Show top discoveries (non-seed pages)")
     disc_p.add_argument("graph", help="Graph JSON file")
     disc_p.add_argument("--top", "-n", type=int, default=20, help="Top N results")
+    disc_p.add_argument("--damping", type=float, default=0.95, help="PageRank damping factor (default: 0.95)")
+    disc_p.add_argument("--iterations", type=int, default=50, help="PageRank iterations (default: 50)")
 
     # fork
-    fork_p = subparsers.add_parser("fork", help="Fork a graph")
+    fork_p = subparsers.add_parser("fork", help="Fork a graph with new params/seeds")
     fork_p.add_argument("graph", help="Graph JSON file to fork")
     fork_p.add_argument("--output", "-o", default="", help="Output file")
     fork_p.add_argument("--name", default="", help="Name for forked graph")
     fork_p.add_argument("--author", default="", help="Author of the fork")
+    fork_p.add_argument("--add-seeds", nargs="+", default=[], help="URLs to add as seeds")
+    fork_p.add_argument("--promote-top", type=int, default=0,
+                         help="Auto-promote top N discoveries to seeds (e.g. --promote-top 10)")
+    fork_p.add_argument("--recrawl", action="store_true",
+                         help="After forking, re-crawl from all seeds (including promoted ones)")
+    fork_p.add_argument("--hops", type=int, default=2, help="Hops for re-crawl (default: 2)")
+    fork_p.add_argument("--max-pages", type=int, default=200, help="Max pages for re-crawl (default: 200)")
+    fork_p.add_argument("--domain-cap", type=int, default=20, help="Domain cap for re-crawl (default: 20)")
+    fork_p.add_argument("--damping", type=float, default=0.95, help="PageRank damping for this fork (default: 0.95)")
+    fork_p.add_argument("--iterations", type=int, default=50, help="PageRank iterations (default: 50)")
 
     # merge
     merge_p = subparsers.add_parser("merge", help="Merge two graphs")
@@ -715,8 +769,8 @@ def main():
 
     elif args.command == "rank":
         graph = WebGraph.load(args.graph)
-        ranks = graph.pagerank()
-        print(f"top {args.top} pages by local pagerank:\n")
+        ranks = graph.pagerank(damping=args.damping, iterations=args.iterations)
+        print(f"top {args.top} pages by local pagerank (damping={args.damping}, iter={args.iterations}):\n")
         for i, (url, score) in enumerate(list(ranks.items())[:args.top]):
             node = graph.nodes.get(url, {})
             title = node.get("title", "")
@@ -727,8 +781,8 @@ def main():
 
     elif args.command == "discover":
         graph = WebGraph.load(args.graph)
-        discoveries = graph.discoveries(top_n=args.top)
-        print(f"top {args.top} discoveries (pages found by crawling, not seeds):\n")
+        discoveries = graph.discoveries(top_n=args.top, damping=args.damping, iterations=args.iterations)
+        print(f"top {args.top} discoveries (damping={args.damping}, iter={args.iterations}):\n")
         for i, (url, score, node) in enumerate(discoveries):
             title = node.get("title", "")
             desc = node.get("description", "")
@@ -740,9 +794,49 @@ def main():
 
     elif args.command == "fork":
         graph = WebGraph.load(args.graph)
-        forked = graph.fork(name=args.name, author=args.author)
+        forked = graph.fork(
+            name=args.name,
+            author=args.author,
+            add_seeds=args.add_seeds if args.add_seeds else None,
+            promote_top_n=args.promote_top,
+        )
+
+        # Store pagerank params in metadata so they persist with the graph
+        forked.metadata["damping"] = args.damping
+        forked.metadata["iterations"] = args.iterations
+
         output = args.output or f"fork-{Path(args.graph).stem}.json"
-        forked.save(output)
+
+        # Show what changed
+        original_seeds = len(graph.seeds)
+        new_seeds = len(forked.seeds)
+        if new_seeds > original_seeds:
+            print(f"seeds: {original_seeds} → {new_seeds} (+{new_seeds - original_seeds} new)")
+            for seed in sorted(forked.seeds - graph.seeds):
+                node = graph.nodes.get(seed, {})
+                print(f"  + {node.get('title', seed)[:60]}")
+        print(f"damping: {args.damping}, iterations: {args.iterations}")
+
+        if args.recrawl:
+            # Re-crawl from the forked graph's seeds with new params
+            print(f"\nre-crawling from {new_seeds} seeds...")
+            new_graph = asyncio.run(crawl(
+                list(forked.seeds),
+                max_hops=args.hops,
+                max_pages=args.max_pages,
+                name=forked.metadata.get("name", "fork"),
+                domain_cap=args.domain_cap,
+            ))
+            # Preserve fork provenance in the new graph
+            new_graph.metadata["forked_from"] = forked.metadata.get("forked_from", "unknown")
+            new_graph.metadata["forked_at"] = forked.metadata.get("forked_at", "")
+            new_graph.metadata["damping"] = args.damping
+            new_graph.metadata["iterations"] = args.iterations
+            if forked.metadata.get("seeds_promoted"):
+                new_graph.metadata["seeds_promoted"] = forked.metadata["seeds_promoted"]
+            new_graph.save(output)
+        else:
+            forked.save(output)
 
     elif args.command == "merge":
         graph_a = WebGraph.load(args.graph_a)

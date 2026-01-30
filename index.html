@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smallweb</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Berkeley Mono', 'IBM Plex Mono', 'JetBrains Mono', monospace;
+    background: #0a0a0a;
+    color: #e0e0e0;
+    min-height: 100vh;
+  }
+
+  .container { max-width: 960px; margin: 0 auto; padding: 2rem; }
+
+  /* Header */
+  header { margin-bottom: 2.5rem; }
+  header h1 { font-size: 1.6rem; color: #fff; margin-bottom: 0.3rem; }
+  header h1 span { color: #4fc3f7; }
+  header p { color: #555; font-size: 0.85rem; }
+
+  /* New Crawl Form */
+  .crawl-form {
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 10px;
+    padding: 1.5rem;
+    margin-bottom: 2.5rem;
+  }
+  .crawl-form h2 { font-size: 0.9rem; color: #888; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .form-row { display: flex; gap: 0.8rem; margin-bottom: 0.8rem; flex-wrap: wrap; }
+  .form-row.seeds-row { flex-wrap: nowrap; }
+
+  .form-field { flex: 1; min-width: 0; }
+  .form-field.seeds-field { flex: 3; }
+  .form-field.small { flex: 0 0 80px; }
+
+  .form-field label { display: block; color: #666; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.3rem; }
+
+  input, select, textarea {
+    width: 100%;
+    background: #0a0a0a;
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    padding: 0.6rem 0.8rem;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.85rem;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  input:focus, textarea:focus { border-color: #4fc3f7; }
+  input::placeholder, textarea::placeholder { color: #333; }
+
+  .btn {
+    background: #4fc3f7;
+    color: #000;
+    border: none;
+    border-radius: 6px;
+    padding: 0.6rem 1.2rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+    white-space: nowrap;
+  }
+  .btn:hover { background: #81d4fa; }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+  .btn-outline {
+    background: transparent;
+    border: 1px solid #333;
+    color: #888;
+  }
+  .btn-outline:hover { border-color: #4fc3f7; color: #4fc3f7; }
+
+  .btn-fork {
+    background: transparent;
+    border: 1px solid #332a15;
+    color: #aa8844;
+    font-size: 0.75rem;
+    padding: 0.3rem 0.7rem;
+    margin-top: 0.6rem;
+  }
+  .btn-fork:hover { background: #1a1510; border-color: #aa8844; }
+
+  /* Crawl status */
+  .crawl-status {
+    display: none;
+    background: #0d1117;
+    border: 1px solid #1a3050;
+    border-radius: 8px;
+    padding: 1rem;
+    margin-top: 1rem;
+    font-size: 0.85rem;
+  }
+  .crawl-status.active { display: block; }
+  .crawl-status .status-text { color: #4fc3f7; }
+  .crawl-status .status-done { color: #81c784; }
+  .crawl-status .status-error { color: #ef5350; }
+
+  /* Graph list */
+  .graphs-section { margin-bottom: 2rem; }
+  .graphs-section h2 {
+    font-size: 0.9rem;
+    color: #888;
+    margin-bottom: 1rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid #1a1a1a;
+    padding-bottom: 0.5rem;
+  }
+
+  .graph-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 1rem;
+  }
+
+  .graph-card {
+    background: #111;
+    border: 1px solid #222;
+    border-radius: 10px;
+    padding: 1.2rem;
+    transition: border-color 0.2s, transform 0.1s;
+    display: block;
+  }
+  .graph-card:hover { border-color: #333; }
+
+  .graph-card-header { cursor: pointer; text-decoration: none; display: block; }
+  .graph-card-header:hover .graph-card-name { color: #4fc3f7; }
+
+  .graph-card-name { color: #fff; font-size: 1rem; margin-bottom: 0.5rem; font-weight: 600; transition: color 0.2s; }
+  .graph-card-meta { color: #555; font-size: 0.75rem; margin-bottom: 0.8rem; }
+
+  .graph-card-stats { display: flex; gap: 1rem; }
+  .graph-card-stat { }
+  .graph-card-stat-value { color: #e0e0e0; font-size: 1.1rem; font-weight: 600; }
+  .graph-card-stat-label { color: #555; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.03em; }
+
+  .graph-card .forked-badge {
+    display: inline-block;
+    background: #1a1510;
+    border: 1px solid #332a15;
+    color: #aa8844;
+    font-size: 0.7rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+
+  .graph-card-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.8rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid #1a1a1a;
+  }
+
+  /* Modal */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.active { display: flex; }
+
+  .modal {
+    background: #111;
+    border: 1px solid #2a2a2a;
+    border-radius: 12px;
+    padding: 2rem;
+    width: 90%;
+    max-width: 560px;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .modal h2 {
+    font-size: 1.1rem;
+    color: #fff;
+    margin-bottom: 0.3rem;
+  }
+  .modal .modal-subtitle {
+    color: #555;
+    font-size: 0.8rem;
+    margin-bottom: 1.5rem;
+  }
+
+  .modal .form-row { margin-bottom: 1rem; }
+
+  .modal .form-section {
+    margin-bottom: 1.2rem;
+    padding-bottom: 1.2rem;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  .modal .form-section:last-of-type { border-bottom: none; }
+  .modal .form-section h3 {
+    font-size: 0.75rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.8rem;
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 0.8rem;
+  }
+  .toggle {
+    position: relative;
+    width: 40px;
+    height: 22px;
+    flex-shrink: 0;
+  }
+  .toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+    position: absolute;
+  }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: #2a2a2a;
+    border-radius: 11px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    left: 3px;
+    bottom: 3px;
+    background: #666;
+    border-radius: 50%;
+    transition: transform 0.2s, background 0.2s;
+  }
+  .toggle input:checked + .toggle-slider { background: #1a3050; }
+  .toggle input:checked + .toggle-slider::before { transform: translateX(18px); background: #4fc3f7; }
+
+  .toggle-label { color: #888; font-size: 0.85rem; }
+  .toggle-desc { color: #555; font-size: 0.75rem; margin-top: 0.2rem; }
+
+  .modal-actions {
+    display: flex;
+    gap: 0.8rem;
+    justify-content: flex-end;
+    margin-top: 1.5rem;
+  }
+
+  .recrawl-options {
+    display: none;
+    margin-top: 1rem;
+    padding: 1rem;
+    background: #0d1117;
+    border: 1px solid #1a3050;
+    border-radius: 8px;
+  }
+  .recrawl-options.active { display: block; }
+
+  /* Empty state */
+  .empty-state {
+    text-align: center;
+    padding: 3rem;
+    color: #444;
+    font-size: 0.9rem;
+  }
+
+  /* Loading spinner */
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid #333;
+    border-top-color: #4fc3f7;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 0.5rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Footer */
+  footer {
+    margin-top: 3rem;
+    padding-top: 1rem;
+    border-top: 1px solid #1a1a1a;
+    color: #333;
+    font-size: 0.75rem;
+  }
+  footer a { color: #444; text-decoration: none; }
+  footer a:hover { color: #4fc3f7; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1><span>smallweb</span></h1>
+    <p>niche web discovery engine &mdash; crawl outward from seeds, rank by local pagerank, find the good stuff</p>
+  </header>
+
+  <!-- New Crawl -->
+  <div class="crawl-form">
+    <h2>new crawl</h2>
+    <form id="crawlForm" onsubmit="startCrawl(event)">
+      <div class="form-row seeds-row">
+        <div class="form-field seeds-field">
+          <label>seed urls (comma-separated)</label>
+          <input type="text" id="seeds" placeholder="https://wiki.xxiivv.com, https://100r.co, https://solar.lowtechmagazine.com" required>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-field">
+          <label>name</label>
+          <input type="text" id="crawlName" placeholder="my-web-corner">
+        </div>
+        <div class="form-field small">
+          <label>hops</label>
+          <input type="number" id="hops" value="1" min="1" max="3">
+        </div>
+        <div class="form-field small">
+          <label>max pages</label>
+          <input type="number" id="maxPages" value="100" min="10" max="500" step="10">
+        </div>
+        <div class="form-field" style="flex: 0 0 auto; display: flex; align-items: flex-end;">
+          <button type="submit" class="btn" id="crawlBtn">crawl</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="crawl-status" id="crawlStatus">
+      <span class="spinner"></span>
+      <span id="crawlStatusText" class="status-text">starting crawl...</span>
+    </div>
+  </div>
+
+  <!-- Graphs -->
+  <div class="graphs-section">
+    <h2>discovery graphs</h2>
+    <div class="graph-grid" id="graphGrid">
+      <div class="empty-state">loading...</div>
+    </div>
+  </div>
+
+  <footer>
+    <a href="https://github.com/xidequest">smallweb</a> &mdash; your web, your rank, your discoveries
+  </footer>
+</div>
+
+<!-- Fork Modal -->
+<div class="modal-overlay" id="forkModal">
+  <div class="modal">
+    <h2>fork graph</h2>
+    <div class="modal-subtitle" id="forkSource">forking: —</div>
+
+    <div class="form-section">
+      <h3>basics</h3>
+      <div class="form-row">
+        <div class="form-field">
+          <label>fork name</label>
+          <input type="text" id="forkName" placeholder="my-fork">
+        </div>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <h3>pagerank params</h3>
+      <div class="form-row">
+        <div class="form-field">
+          <label>damping (0.5 = close to seeds, 0.95 = deep chains)</label>
+          <input type="number" id="forkDamping" value="0.95" min="0.1" max="0.99" step="0.05">
+        </div>
+        <div class="form-field">
+          <label>iterations</label>
+          <input type="number" id="forkIterations" value="50" min="5" max="200" step="5">
+        </div>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <h3>seed promotion</h3>
+      <div class="form-row">
+        <div class="form-field">
+          <label>promote top N discoveries to seeds</label>
+          <input type="number" id="forkPromoteTop" value="0" min="0" max="50">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-field">
+          <label>add extra seed urls (one per line)</label>
+          <textarea id="forkAddSeeds" rows="3" placeholder="https://example.com&#10;https://another-site.org"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-section">
+      <h3>re-crawl</h3>
+      <div class="toggle-row">
+        <label class="toggle">
+          <input type="checkbox" id="forkRecrawl" onchange="toggleRecrawlOptions()">
+          <span class="toggle-slider"></span>
+        </label>
+        <div>
+          <div class="toggle-label">re-crawl from seeds</div>
+          <div class="toggle-desc">crawl again from all seeds (including promoted ones) with fresh data</div>
+        </div>
+      </div>
+
+      <div class="recrawl-options" id="recrawlOptions">
+        <div class="form-row">
+          <div class="form-field small">
+            <label>hops</label>
+            <input type="number" id="forkHops" value="2" min="1" max="3">
+          </div>
+          <div class="form-field small">
+            <label>max pages</label>
+            <input type="number" id="forkMaxPages" value="200" min="10" max="500" step="10">
+          </div>
+          <div class="form-field small">
+            <label>domain cap</label>
+            <input type="number" id="forkDomainCap" value="20" min="1" max="50">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeForkModal()">cancel</button>
+      <button class="btn" id="forkBtn" onclick="submitFork()">fork</button>
+    </div>
+
+    <div class="crawl-status" id="forkStatus">
+      <span class="spinner"></span>
+      <span id="forkStatusText" class="status-text">forking...</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/smallweb/api';
+let currentForkId = null;
+
+async function loadGraphs() {
+  try {
+    const res = await fetch(`${API}/graphs`);
+    const data = await res.json();
+    const grid = document.getElementById('graphGrid');
+
+    if (!data.graphs || data.graphs.length === 0) {
+      grid.innerHTML = '<div class="empty-state">no graphs yet &mdash; start a crawl above</div>';
+      return;
+    }
+
+    grid.innerHTML = data.graphs.map(g => {
+      const date = g.created_at ? new Date(g.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+      const forked = g.forked_from ? `<div class="forked-badge">forked from ${g.forked_from}</div>` : '';
+      return `
+        <div class="graph-card">
+          <div class="graph-card-header" onclick="viewGraph('${g.id}')">
+            ${forked}
+            <div class="graph-card-name">${g.name}</div>
+            <div class="graph-card-meta">${date}${g.author ? ' &middot; ' + g.author : ''}</div>
+            <div class="graph-card-stats">
+              <div class="graph-card-stat">
+                <div class="graph-card-stat-value">${g.nodes}</div>
+                <div class="graph-card-stat-label">pages</div>
+              </div>
+              <div class="graph-card-stat">
+                <div class="graph-card-stat-value">${g.edges}</div>
+                <div class="graph-card-stat-label">links</div>
+              </div>
+              <div class="graph-card-stat">
+                <div class="graph-card-stat-value">${g.seeds}</div>
+                <div class="graph-card-stat-label">seeds</div>
+              </div>
+            </div>
+          </div>
+          <div class="graph-card-actions">
+            <button class="btn btn-fork" onclick="openForkModal('${g.id}', '${g.name}')">fork</button>
+            <button class="btn btn-fork" onclick="viewGraph('${g.id}')">view</button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (e) {
+    document.getElementById('graphGrid').innerHTML = `<div class="empty-state">error loading graphs: ${e.message}</div>`;
+  }
+}
+
+function viewGraph(id) {
+  window.location.href = `${API}/graphs/${id}/html`;
+}
+
+// ── Fork Modal ──
+
+function openForkModal(graphId, graphName) {
+  currentForkId = graphId;
+  document.getElementById('forkSource').textContent = `forking: ${graphName}`;
+  document.getElementById('forkName').value = `fork-${graphId}`;
+  document.getElementById('forkDamping').value = '0.95';
+  document.getElementById('forkIterations').value = '50';
+  document.getElementById('forkPromoteTop').value = '0';
+  document.getElementById('forkAddSeeds').value = '';
+  document.getElementById('forkRecrawl').checked = false;
+  document.getElementById('recrawlOptions').classList.remove('active');
+  document.getElementById('forkStatus').classList.remove('active');
+  document.getElementById('forkBtn').disabled = false;
+  document.getElementById('forkBtn').textContent = 'fork';
+  document.getElementById('forkModal').classList.add('active');
+}
+
+function closeForkModal() {
+  document.getElementById('forkModal').classList.remove('active');
+  currentForkId = null;
+}
+
+function toggleRecrawlOptions() {
+  const checked = document.getElementById('forkRecrawl').checked;
+  document.getElementById('recrawlOptions').classList.toggle('active', checked);
+  document.getElementById('forkBtn').textContent = checked ? 'fork + crawl' : 'fork';
+}
+
+async function submitFork() {
+  if (!currentForkId) return;
+
+  const btn = document.getElementById('forkBtn');
+  const statusEl = document.getElementById('forkStatus');
+  const statusText = document.getElementById('forkStatusText');
+
+  // Build request body
+  const body = {
+    name: document.getElementById('forkName').value || `fork-${currentForkId}`,
+    damping: parseFloat(document.getElementById('forkDamping').value),
+    iterations: parseInt(document.getElementById('forkIterations').value),
+    promote_top: parseInt(document.getElementById('forkPromoteTop').value),
+    recrawl: document.getElementById('forkRecrawl').checked,
+  };
+
+  // Parse extra seeds
+  const seedsText = document.getElementById('forkAddSeeds').value.trim();
+  if (seedsText) {
+    body.add_seeds = seedsText.split('\n').map(s => s.trim()).filter(Boolean);
+  }
+
+  // Add recrawl params if enabled
+  if (body.recrawl) {
+    body.hops = parseInt(document.getElementById('forkHops').value);
+    body.max_pages = parseInt(document.getElementById('forkMaxPages').value);
+    body.domain_cap = parseInt(document.getElementById('forkDomainCap').value);
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'forking...';
+  statusEl.classList.add('active');
+  statusText.className = 'status-text';
+  statusText.textContent = body.recrawl ? 'forking + starting re-crawl...' : 'forking graph...';
+
+  try {
+    const res = await fetch(`${API}/graphs/${currentForkId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'fork failed');
+    }
+
+    if (body.recrawl && data.status === 'running') {
+      // Poll for crawl completion
+      statusText.textContent = `${data.message}`;
+      const crawlId = data.id;
+
+      const poll = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API}/crawl/${crawlId}`);
+          const statusData = await statusRes.json();
+
+          if (statusData.status === 'done') {
+            clearInterval(poll);
+            statusText.className = 'status-done';
+            const r = statusData.result;
+            statusText.textContent = `done! ${r.nodes} pages, ${r.edges} links, ${r.domains} domains`;
+            btn.disabled = false;
+            btn.textContent = 'fork + crawl';
+            setTimeout(() => {
+              loadGraphs();
+              closeForkModal();
+            }, 1500);
+          } else if (statusData.status === 'error') {
+            clearInterval(poll);
+            statusText.className = 'status-error';
+            statusText.textContent = `error: ${statusData.error}`;
+            btn.disabled = false;
+            btn.textContent = 'fork + crawl';
+          } else {
+            statusText.textContent = statusData.progress || 'crawling...';
+          }
+        } catch (e) {
+          // Ignore poll errors
+        }
+      }, 2000);
+    } else {
+      // Fork without recrawl — done immediately
+      statusText.className = 'status-done';
+      const seedInfo = data.new_seeds > 0 ? `, +${data.new_seeds} new seeds` : '';
+      statusText.textContent = `forked! ${data.message}${seedInfo}`;
+      btn.disabled = false;
+      btn.textContent = 'fork';
+      setTimeout(() => {
+        loadGraphs();
+        closeForkModal();
+      }, 1500);
+    }
+  } catch (e) {
+    statusText.className = 'status-error';
+    statusText.textContent = `error: ${e.message}`;
+    btn.disabled = false;
+    btn.textContent = body.recrawl ? 'fork + crawl' : 'fork';
+  }
+}
+
+// Close modal on overlay click
+document.getElementById('forkModal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeForkModal();
+});
+
+// Close modal on Escape
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeForkModal();
+});
+
+// ── Crawl ──
+
+async function startCrawl(event) {
+  event.preventDefault();
+
+  const seeds = document.getElementById('seeds').value;
+  const name = document.getElementById('crawlName').value;
+  const hops = parseInt(document.getElementById('hops').value);
+  const maxPages = parseInt(document.getElementById('maxPages').value);
+  const btn = document.getElementById('crawlBtn');
+  const statusEl = document.getElementById('crawlStatus');
+  const statusText = document.getElementById('crawlStatusText');
+
+  btn.disabled = true;
+  btn.textContent = 'crawling...';
+  statusEl.classList.add('active');
+  statusText.className = 'status-text';
+  statusText.textContent = 'starting crawl...';
+
+  try {
+    const res = await fetch(`${API}/crawl`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        seeds: seeds,
+        name: name,
+        hops: hops,
+        max_pages: maxPages,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'crawl failed');
+    }
+
+    statusText.textContent = data.message;
+
+    // Poll for completion
+    const crawlId = data.id;
+    const poll = setInterval(async () => {
+      try {
+        const statusRes = await fetch(`${API}/crawl/${crawlId}`);
+        const statusData = await statusRes.json();
+
+        if (statusData.status === 'done') {
+          clearInterval(poll);
+          statusText.className = 'status-done';
+          const r = statusData.result;
+          statusText.textContent = `done! ${r.nodes} pages, ${r.edges} links, ${r.domains} domains`;
+          btn.disabled = false;
+          btn.textContent = 'crawl';
+          setTimeout(loadGraphs, 500);
+        } else if (statusData.status === 'error') {
+          clearInterval(poll);
+          statusText.className = 'status-error';
+          statusText.textContent = `error: ${statusData.error}`;
+          btn.disabled = false;
+          btn.textContent = 'crawl';
+        } else {
+          statusText.textContent = statusData.progress || 'crawling...';
+        }
+      } catch (e) {
+        // Ignore poll errors, keep trying
+      }
+    }, 2000);
+  } catch (e) {
+    statusText.className = 'status-error';
+    statusText.textContent = `error: ${e.message}`;
+    btn.disabled = false;
+    btn.textContent = 'crawl';
+  }
+}
+
+// Load graphs on page load
+loadGraphs();
+</script>
+</body>
+</html>

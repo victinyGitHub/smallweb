@@ -194,6 +194,93 @@ async def handle_list_crawls(request):
     return web.json_response({"crawls": active_crawls})
 
 
+async def handle_fork(request):
+    """Fork an existing graph with new params and optionally re-crawl."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    try:
+        body = await request.json()
+    except:
+        body = {}
+
+    graph = WebGraph.load(str(path))
+
+    # Fork with optional seed promotion
+    name = body.get("name", f"fork-{graph_id}")
+    add_seeds = body.get("add_seeds", [])
+    promote_top = int(body.get("promote_top", 0))
+    damping = float(body.get("damping", 0.95))
+    iterations = int(body.get("iterations", 50))
+
+    forked = graph.fork(
+        name=name,
+        add_seeds=add_seeds if add_seeds else None,
+        promote_top_n=promote_top,
+    )
+    forked.metadata["damping"] = damping
+    forked.metadata["iterations"] = iterations
+
+    # Generate safe filename
+    safe_name = "".join(c for c in name if c.isalnum() or c in "-_").lower()[:50]
+    if not safe_name:
+        safe_name = f"fork-{graph_id}"
+    output_path = GRAPHS_DIR / f"{safe_name}.json"
+    if output_path.exists():
+        safe_name = f"{safe_name}-{int(time.time()) % 10000}"
+        output_path = GRAPHS_DIR / f"{safe_name}.json"
+
+    recrawl = body.get("recrawl", False)
+    if recrawl:
+        # Re-crawl from forked seeds
+        hops = min(int(body.get("hops", 2)), 3)
+        max_pages = min(int(body.get("max_pages", 200)), 500)
+        domain_cap = min(int(body.get("domain_cap", 20)), 50)
+
+        crawl_id = safe_name
+        active_crawls[crawl_id] = {
+            "status": "running",
+            "name": name,
+            "safe_name": safe_name,
+            "seeds": list(forked.seeds),
+            "hops": hops,
+            "max_pages": max_pages,
+            "started_at": datetime.now().isoformat(),
+            "progress": "forking + re-crawling...",
+            "forked_from": graph_id,
+        }
+        asyncio.create_task(_run_crawl(crawl_id, list(forked.seeds), hops, max_pages, name, output_path, domain_cap))
+
+        return web.json_response({
+            "id": crawl_id,
+            "status": "running",
+            "forked_from": graph_id,
+            "seeds": len(forked.seeds),
+            "original_seeds": len(graph.seeds),
+            "new_seeds": len(forked.seeds) - len(graph.seeds),
+            "message": f"forking {graph_id} with {len(forked.seeds)} seeds, re-crawling...",
+        })
+    else:
+        # Just save the forked graph (no re-crawl)
+        forked.save(str(output_path))
+        html = render_html(forked, output_path.name)
+        html_path = STATIC_DIR / f"{safe_name}.html"
+        html_path.write_text(html)
+
+        return web.json_response({
+            "id": safe_name,
+            "forked_from": graph_id,
+            "seeds": len(forked.seeds),
+            "original_seeds": len(graph.seeds),
+            "new_seeds": len(forked.seeds) - len(graph.seeds),
+            "damping": damping,
+            "iterations": iterations,
+            "message": f"forked {graph_id} → {safe_name}",
+        })
+
+
 async def handle_discoveries(request):
     """Get discoveries for a graph."""
     graph_id = request.match_info["id"]
@@ -226,6 +313,7 @@ def create_app():
     app.router.add_get("/api/graphs/{id}", handle_get_graph)
     app.router.add_get("/api/graphs/{id}/html", handle_graph_html)
     app.router.add_get("/api/graphs/{id}/discoveries", handle_discoveries)
+    app.router.add_post("/api/graphs/{id}/fork", handle_fork)
     app.router.add_post("/api/crawl", handle_start_crawl)
     app.router.add_get("/api/crawl/{id}", handle_crawl_status)
     app.router.add_get("/api/crawls", handle_list_crawls)
