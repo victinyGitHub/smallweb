@@ -38,14 +38,41 @@ The crawler is async (aiohttp) with concurrent fetching and two diversity mechan
 
 The queue works as a breadth-first search with a diversity twist: after each batch of concurrent fetches, the queue is re-prioritized so domains you've barely touched get processed before domains you've already hit the cap on.
 
-### PageRank
+### Ranking: PageRank × Quality × Smallweb Score
 
-Local PageRank runs on your subgraph only, not the whole internet. Parameters:
+Discovery ranking combines three independent signals:
 
-- **Damping** (default `0.95`) — probability of following a link vs jumping to a random page. Higher values (like 0.95) give more weight to link structure; lower values (like 0.5) spread rank more evenly. Think of it as "how much does a link endorsement matter?"
-- **Iterations** (default `50`) — number of power iteration rounds. 50 is way more than enough for convergence on small graphs.
+**PageRank** — local link authority on your subgraph, not the whole internet.
+- *Damping* (default `0.95`) — probability of following a link vs teleporting. Higher = more link-dependent.
+- *Personalized mode* — biases teleport toward seed pages, so discoveries are "near" your seeds in link-space.
+- Dangling nodes redistribute rank uniformly (standard PageRank).
 
-Dangling nodes (pages with no outlinks) redistribute their rank uniformly across all pages, matching the original PageRank paper.
+**Quality Score** — HTML cleanliness (0.0–1.0):
+- Penalizes excessive scripts, tracking domains, low text-to-HTML ratio, high link density.
+- A page with clean HTML and real content scores ~1.0. A tracker-heavy SPA scores ~0.3.
+
+**Smallweb Score** — data-driven "small-web-ness" per domain (0.0–1.0):
+- *Outlink profile*: what fraction of a domain's outlinks point to other domains **in our graph** (ecosystem integration)? Sites linking into our discovered ecosystem score higher than sites linking to random external stuff.
+- *Popularity bell curve*: peaks at 2–8 inbound domains (the sweet spot for small web). Drops off for orphans (0 inbound) and platforms (60+ inbound).
+- Combined: `popularity × (0.5 + 0.5 × outlink_profile)`
+
+Final score: `pagerank × quality × smallweb_score`
+
+### Co-Citation Similarity
+
+Find sites similar to any domain using co-citation analysis. Two domains are "similar" if they're linked FROM the same sources — cosine similarity on binary inbound-link vectors.
+
+```bash
+# Find sites similar to a domain
+curl http://localhost:8420/api/graphs/my-graph/similar?target=wiki.xxiivv.com&top=10
+
+# Get top similar pairs across the whole graph
+curl http://localhost:8420/api/graphs/my-graph/similarities?min_shared=2&top=20
+```
+
+### Anchor Text
+
+The crawler captures anchor text (the visible text of links). This tells you how other sites describe a page, which is often more useful than the page's own title/description.
 
 ## Commands
 
@@ -206,7 +233,9 @@ python server.py --port 8420
 | `GET` | `/api/graphs` | List all saved graphs |
 | `GET` | `/api/graphs/{id}` | Get graph JSON |
 | `GET` | `/api/graphs/{id}/html` | Get rendered HTML |
-| `GET` | `/api/graphs/{id}/discoveries` | Get discoveries (supports `?damping=F&iterations=N`) |
+| `GET` | `/api/graphs/{id}/discoveries` | Get discoveries (`?top=N&personalized=true/false`) |
+| `GET` | `/api/graphs/{id}/similar` | Find similar domains (`?target=DOMAIN&top=N`) |
+| `GET` | `/api/graphs/{id}/similarities` | Top similar pairs (`?min_shared=N&top=N`) |
 | `POST` | `/api/crawl` | Start a new crawl |
 | `GET` | `/api/crawl/{id}` | Check crawl status |
 | `POST` | `/api/graphs/{id}/fork` | Fork a graph |
@@ -233,10 +262,44 @@ When `recrawl` is `false` (default), the fork is instant — just a copy with ne
 
 ### Frontend
 
-`index.html` provides:
-- **Graph cards** — browse all saved graphs with stats (nodes, edges, seeds, domains)
-- **Crawl form** — start new crawls from the browser with seed URLs, hops, max pages, domain cap
-- **Fork modal** — fork any graph with: new name, damping/iterations, promote top N discoveries to seeds, add custom seeds, optional re-crawl with full param control
+**Homepage** (`index.html`):
+- Graph cards — browse all saved graphs with stats
+- Crawl form — start new crawls from the browser
+- Fork modal — fork with param changes, seed promotion, re-crawl
+
+**Graph detail page** (tabbed interface):
+- **Discoveries tab** — ranked discovery cards with:
+  - Quality bar (green/yellow/red)
+  - Smallweb score indicator (dot + inbound count + outlink %)
+  - Anchor text pills (how other sites describe this page)
+  - "Find similar" button on each card
+  - Toggle: personalized vs standard PageRank
+  - Sort: pagerank / quality / smallweb / blended
+- **Similarity tab** — co-citation explorer:
+  - Search box to find sites similar to any domain
+  - Auto-computed top similar pairs
+  - Click any domain to explore its neighborhood
+- **Seeds & domains tab** — clickable domain tags, seed list
+
+### Discovery Response Format
+
+Each discovery in the API includes:
+
+```json
+{
+  "url": "https://example.com/page",
+  "score": 0.00028,
+  "title": "Page Title",
+  "description": "...",
+  "domain": "example.com",
+  "quality": 0.85,
+  "anchor_texts": ["cool page", "interesting read"],
+  "smallweb_score": 0.7,
+  "inbound_domains": 3,
+  "outlink_score": 0.85,
+  "popularity_score": 1.0
+}
+```
 
 ## Philosophy
 
