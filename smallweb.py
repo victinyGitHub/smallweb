@@ -172,15 +172,35 @@ class WebGraph:
             personalized: Use personalized pagerank (biased toward seeds)
         """
         ranks = self.pagerank(damping=damping, iterations=iterations, personalized=personalized)
+
+        # Build set of seed domains to filter out same-domain pages
+        # e.g. if seed is gutenberg.org/files/59/..., filter out gutenberg.org/
+        seed_domains = set()
+        for seed in self.seeds:
+            try:
+                seed_domains.add(urlparse(seed).netloc.lower())
+            except Exception:
+                pass
+
         results = []
         for url, score in ranks.items():
-            if url not in self.seeds and url in self.nodes:
-                if use_quality:
-                    q = self.nodes[url].get("quality", 1.0)
-                    final_score = score * q
-                else:
-                    final_score = score
-                results.append((url, final_score, self.nodes[url]))
+            if url in self.seeds:
+                continue
+            if url not in self.nodes:
+                continue
+            # Skip pages on the same domain as any seed (internal navigation)
+            try:
+                domain = urlparse(url).netloc.lower()
+                if domain in seed_domains:
+                    continue
+            except Exception:
+                pass
+            if use_quality:
+                q = self.nodes[url].get("quality", 1.0)
+                final_score = score * q
+            else:
+                final_score = score
+            results.append((url, final_score, self.nodes[url]))
         # Re-sort by final score after quality weighting
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_n]
