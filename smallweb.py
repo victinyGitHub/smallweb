@@ -788,8 +788,10 @@ PLATFORM_DOMAINS = {
     "vice.com", "buzzfeed.com", "huffpost.com",
     "metro.co.uk",
     # Reference (not discoveries)
-    "en.wikipedia.org", "wikipedia.org", "wikidata.org",
+    "en.wikipedia.org", "wikipedia.org", "www.wikipedia.org", "wikidata.org",
     "wikimedia.org", "archive.org", "web.archive.org",
+    # Education mega-sites
+    "www.khanacademy.org", "khanacademy.org",
     # Misc platforms
     "reddit.com", "news.ycombinator.com", "lobste.rs",
     "patreon.com", "ko-fi.com", "buymeacoffee.com",
@@ -806,6 +808,10 @@ PLATFORM_PATTERNS = [
     ".zendesk.com",
     ".salesforce.com",
     ".sharepoint.com",
+    ".wikipedia.org",
+    ".wikimedia.org",
+    ".wiktionary.org",
+    ".wikibooks.org",
 ]
 
 
@@ -973,6 +979,10 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
                         node["anchor_texts"] = node["anchor_texts"][:20]
 
                     if link_norm not in visited and depth + 1 <= max_hops:
+                        # Don't waste crawl budget on platform domains
+                        link_domain = _get_domain(link)
+                        if is_platform_domain(link_domain):
+                            continue
                         if link_norm not in graph.nodes:
                             graph.add_node(link, depth=depth + 1)
                         queue.append((link, depth + 1))
@@ -1174,11 +1184,11 @@ SERVE_HTML = """<!DOCTYPE html>
       <div>
         <div class="control-label">sort by</div>
         <div class="toggle-group">
-          <button class="toggle-btn active" data-sort="score" onclick="switchSort('score')">pagerank</button>
+          <button class="toggle-btn active" data-sort="blended" onclick="switchSort('blended')">overall</button>
+          <button class="toggle-btn" data-sort="score" onclick="switchSort('score')">pagerank</button>
           <button class="toggle-btn" data-sort="quality" onclick="switchSort('quality')">quality</button>
           <button class="toggle-btn" data-sort="smallweb" onclick="switchSort('smallweb')">smallweb</button>
           <button class="toggle-btn" data-sort="taste" onclick="switchSort('taste')">taste</button>
-          <button class="toggle-btn" data-sort="blended" onclick="switchSort('blended')">blended</button>
         </div>
       </div>
     </div>
@@ -1236,7 +1246,7 @@ SERVE_HTML = """<!DOCTYPE html>
 const GRAPH_ID = '$graph_id';
 const API = '/smallweb/api';
 
-let currentSort = 'score';
+let currentSort = 'blended';
 let currentRank = 'personalized';
 let discoveriesCache = { personalized: null, standard: null };
 
