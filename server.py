@@ -19,12 +19,25 @@ from aiohttp import web
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from smallweb import WebGraph, crawl, render_html
+from taste import TasteModel
 
 GRAPHS_DIR = Path("/var/www/arg/mains.in.net/smallweb/graphs")
 STATIC_DIR = Path("/var/www/arg/mains.in.net/smallweb")
 
 # Track running crawls
 active_crawls = {}  # id -> {status, progress, name, seeds, ...}
+
+# Cache taste models per graph (avoids reloading on every request)
+_taste_cache = {}  # graph_id -> TasteModel
+
+def _get_taste_model(graph_id: str, graph: WebGraph = None) -> TasteModel:
+    """Get or create a TasteModel for a graph."""
+    if graph_id not in _taste_cache:
+        graph_path = str(GRAPHS_DIR / f"{graph_id}.json")
+        _taste_cache[graph_id] = TasteModel(graph=graph, graph_path=graph_path)
+    elif graph is not None:
+        _taste_cache[graph_id].graph = graph
+    return _taste_cache[graph_id]
 
 
 async def handle_index(request):
@@ -39,6 +52,9 @@ async def handle_list_graphs(request):
     """List all saved graphs."""
     graphs = []
     for f in sorted(GRAPHS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        # Skip taste label files and model files
+        if f.stem.endswith(".taste") or f.suffix != ".json":
+            continue
         try:
             with open(f) as fp:
                 data = json.load(fp)
@@ -288,30 +304,57 @@ async def handle_discoveries(request):
     if not path.exists():
         return web.json_response({"error": "graph not found"}, status=404)
 
-    top = int(request.query.get("top", 30))
-    damping = float(request.query.get("damping", 0.95))
-    iterations = int(request.query.get("iterations", 50))
-    personalized = request.query.get("personalized", "true").lower() != "false"
-    graph = WebGraph.load(str(path))
-    discoveries = graph.discoveries(top_n=top, damping=damping, iterations=iterations, personalized=personalized)
+    try:
+        top = int(request.query.get("top", 30))
+        damping = float(request.query.get("damping", 0.95))
+        iterations = int(request.query.get("iterations", 50))
+        personalized = request.query.get("personalized", "true").lower() != "false"
+        graph = WebGraph.load(str(path))
 
-    results = []
-    for url, score, node in discoveries:
-        results.append({
-            "url": url,
-            "score": score,
-            "title": node.get("title", ""),
-            "description": node.get("description", ""),
-            "domain": node.get("domain", ""),
-            "quality": node.get("quality", 1.0),
-            "anchor_texts": node.get("anchor_texts", []),
-            "smallweb_score": node.get("smallweb_score", 0.5),
-            "inbound_domains": node.get("inbound_domains", 0),
-            "outlink_score": node.get("outlink_score", 0.5),
-            "popularity_score": node.get("popularity_score", 0.5),
+        # Load taste model if trained
+        taste = _get_taste_model(graph_id, graph)
+        use_taste = taste.is_trained
+
+        # Run discoveries in a thread to avoid blocking the event loop
+        # (taste scoring loads the embedding model which is CPU-intensive)
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            discoveries = await loop.run_in_executor(
+                pool,
+                lambda: graph.discoveries(
+                    top_n=top, damping=damping, iterations=iterations,
+                    personalized=personalized,
+                    taste_model=taste if use_taste else None,
+                )
+            )
+
+        results = []
+        for url, score, node in discoveries:
+            results.append({
+                "url": url,
+                "score": score,
+                "title": node.get("title", ""),
+                "description": node.get("description", ""),
+                "domain": node.get("domain", ""),
+                "quality": node.get("quality", 1.0),
+                "anchor_texts": node.get("anchor_texts", []),
+                "smallweb_score": node.get("smallweb_score", 0.5),
+                "inbound_domains": node.get("inbound_domains", 0),
+                "outlink_score": node.get("outlink_score", 0.5),
+                "popularity_score": node.get("popularity_score", 0.5),
+                "taste_score": node.get("taste_score", 0.5),
+            })
+
+        return web.json_response({
+            "discoveries": results,
+            "total": len(results),
+            "taste_active": use_taste,
         })
-
-    return web.json_response({"discoveries": results, "total": len(results)})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def handle_similar(request):
@@ -358,8 +401,129 @@ async def handle_similarities(request):
     })
 
 
+async def handle_taste_label(request):
+    """Add a taste label (positive or negative) for a URL."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    try:
+        body = await request.json()
+    except:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    url = body.get("url", "").strip()
+    label = body.get("label", "")  # "positive" or "negative"
+
+    if not url:
+        return web.json_response({"error": "url required"}, status=400)
+    if label not in ("positive", "negative", "remove"):
+        return web.json_response({"error": "label must be 'positive', 'negative', or 'remove'"}, status=400)
+
+    graph = WebGraph.load(str(path))
+    taste = _get_taste_model(graph_id, graph)
+
+    if label == "positive":
+        taste.add_positive(url)
+    elif label == "negative":
+        taste.add_negative(url)
+    elif label == "remove":
+        taste.remove_label(url)
+
+    return web.json_response({
+        "url": url,
+        "label": label,
+        "stats": taste.stats(),
+    })
+
+
+async def handle_taste_train(request):
+    """Train the taste model on current labels."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    graph = WebGraph.load(str(path))
+    taste = _get_taste_model(graph_id, graph)
+
+    # Train in thread (loads embedding model, CPU-intensive)
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        result = await loop.run_in_executor(pool, taste.train)
+    return web.json_response(result)
+
+
+async def handle_taste_status(request):
+    """Get taste model status and labels for a graph."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    graph = WebGraph.load(str(path))
+    taste = _get_taste_model(graph_id, graph)
+
+    return web.json_response({
+        **taste.stats(),
+        "positive_urls": taste.positive,
+        "negative_urls": taste.negative,
+    })
+
+
+async def handle_taste_batch(request):
+    """Add multiple taste labels at once."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+
+    try:
+        body = await request.json()
+    except:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    graph = WebGraph.load(str(path))
+    taste = _get_taste_model(graph_id, graph)
+
+    positive = body.get("positive", [])
+    negative = body.get("negative", [])
+    auto_train = body.get("train", True)
+
+    for url in positive:
+        taste.add_positive(url)
+    for url in negative:
+        taste.add_negative(url)
+
+    result = {"added_positive": len(positive), "added_negative": len(negative)}
+
+    if auto_train and taste.has_labels:
+        train_result = taste.train()
+        result["train"] = train_result
+
+    result["stats"] = taste.stats()
+    return web.json_response(result)
+
+
+async def warmup_embedding_model(app):
+    """Pre-load the sentence-transformer model at startup so first request isn't slow."""
+    import concurrent.futures
+    loop = asyncio.get_event_loop()
+    print("pre-loading embedding model (this takes ~5-10s on first run)...")
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(pool, lambda: __import__('taste')._get_embed_model())
+        print("embedding model loaded ✓")
+    except Exception as e:
+        print(f"warning: failed to pre-load embedding model: {e}")
+        print("taste scoring will load on first use instead")
+
+
 def create_app():
     app = web.Application()
+    app.on_startup.append(warmup_embedding_model)
 
     # API routes
     app.router.add_get("/api/graphs", handle_list_graphs)
@@ -369,6 +533,10 @@ def create_app():
     app.router.add_get("/api/graphs/{id}/similar", handle_similar)
     app.router.add_get("/api/graphs/{id}/similarities", handle_similarities)
     app.router.add_post("/api/graphs/{id}/fork", handle_fork)
+    app.router.add_post("/api/graphs/{id}/taste/label", handle_taste_label)
+    app.router.add_post("/api/graphs/{id}/taste/train", handle_taste_train)
+    app.router.add_get("/api/graphs/{id}/taste", handle_taste_status)
+    app.router.add_post("/api/graphs/{id}/taste/batch", handle_taste_batch)
     app.router.add_post("/api/crawl", handle_start_crawl)
     app.router.add_get("/api/crawl/{id}", handle_crawl_status)
     app.router.add_get("/api/crawls", handle_list_crawls)

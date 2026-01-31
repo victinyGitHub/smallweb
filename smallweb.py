@@ -155,7 +155,8 @@ class WebGraph:
 
     def discoveries(self, top_n: int = 20, damping: float = 0.95,
                      iterations: int = 50, use_quality: bool = True,
-                     personalized: bool = True) -> List[Tuple[str, float, dict]]:
+                     personalized: bool = True,
+                     taste_model=None) -> List[Tuple[str, float, dict]]:
         """
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
@@ -164,9 +165,11 @@ class WebGraph:
         - PageRank (link authority, optionally personalized toward seeds)
         - Quality (HTML cleanliness: scripts, trackers, text ratio)
         - Smallweb score (data-driven: popularity bell curve × outlink profile)
+        - Taste score (neural classifier trained on user feedback, optional)
 
         This means: a page needs good link authority AND clean HTML AND
         moderate popularity AND links to other small sites to rank highly.
+        If a taste model is trained, it further weights by learned preferences.
 
         Args:
             top_n:        Number of discoveries to return
@@ -175,6 +178,7 @@ class WebGraph:
             iterations:   PageRank iterations (50 is usually plenty)
             use_quality:  Multiply by quality + smallweb scores
             personalized: Use personalized pagerank (biased toward seeds)
+            taste_model:  Optional TasteModel instance for neural taste scoring
         """
         ranks = self.pagerank(damping=damping, iterations=iterations, personalized=personalized)
 
@@ -208,18 +212,39 @@ class WebGraph:
                 sw = sw_scores.get(domain, {}).get("smallweb_score", 0.5)
                 final_score = score * q * sw
 
-                # Store smallweb metadata on the node for API/frontend access
+                # Store metadata on the node for API/frontend access
                 sw_data = sw_scores.get(domain, {})
                 self.nodes[url]["smallweb_score"] = sw
                 self.nodes[url]["inbound_domains"] = sw_data.get("inbound_domains", 0)
                 self.nodes[url]["outlink_score"] = sw_data.get("outlink_score", 0.5)
                 self.nodes[url]["popularity_score"] = sw_data.get("popularity_score", 0.5)
+                self.nodes[url]["taste_score"] = 0.5  # default neutral
             else:
                 final_score = score
 
             results.append((url, final_score, self.nodes[url]))
-        # Re-sort by final score after quality weighting
+
+        # First pass sort by graph signals
         results.sort(key=lambda x: x[1], reverse=True)
+
+        # Apply taste scoring to top candidates only (expensive: runs embeddings)
+        # Only score 2x the requested results to keep it fast
+        if taste_model and taste_model.is_trained:
+            candidates = results[:top_n * 2]
+            candidate_urls = [url for url, _, _ in candidates]
+            taste_scores = taste_model.score_all(candidate_urls)
+
+            # Re-score with taste
+            rescored = []
+            for url, score, node in candidates:
+                taste = taste_scores.get(url, 0.5)
+                node["taste_score"] = taste
+                new_score = score * (0.5 + 0.5 * taste)
+                rescored.append((url, new_score, node))
+
+            rescored.sort(key=lambda x: x[1], reverse=True)
+            return rescored[:top_n]
+
         return results[:top_n]
 
     def _build_inbound_index(self) -> Dict[str, Set[str]]:
@@ -1039,6 +1064,25 @@ SERVE_HTML = """<!DOCTYPE html>
   .sw-label { font-size: 0.6rem; color: #555; }
   .sw-details { font-size: 0.58rem; color: #3a3a3a; margin-top: 0.1rem; }
 
+  /* Taste buttons */
+  .taste-btns { display: flex; gap: 0.3rem; margin-top: 0.3rem; }
+  .taste-btn { background: none; border: 1px solid #1a1a1a; color: #444; font-size: 0.75rem; padding: 0.15rem 0.4rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.15s; line-height: 1; }
+  .taste-btn:hover { border-color: #555; color: #aaa; }
+  .taste-btn.positive { border-color: #2d5a2d; color: #81c784; background: #0a1a0a; }
+  .taste-btn.negative { border-color: #5a2d2d; color: #ef5350; background: #1a0a0a; }
+  .taste-score { font-size: 0.6rem; color: #555; margin-top: 0.1rem; }
+
+  /* Taste panel */
+  .taste-panel { background: #111; border: 1px solid #222; border-radius: 10px; padding: 1rem 1.2rem; margin-bottom: 1.5rem; }
+  .taste-panel h3 { font-size: 0.85rem; color: #ddd; margin-bottom: 0.5rem; }
+  .taste-panel p { font-size: 0.75rem; color: #666; margin-bottom: 0.6rem; line-height: 1.4; }
+  .taste-stats { display: flex; gap: 1rem; margin-bottom: 0.8rem; flex-wrap: wrap; }
+  .taste-stat { font-size: 0.75rem; color: #888; }
+  .taste-stat strong { color: #ddd; }
+  .btn-train { background: #4fc3f7; color: #000; border: none; border-radius: 6px; padding: 0.4rem 0.8rem; font-family: inherit; font-size: 0.8rem; font-weight: 600; cursor: pointer; }
+  .btn-train:hover { background: #81d4fa; }
+  .btn-train:disabled { background: #333; color: #666; cursor: not-allowed; }
+
   /* Similar button */
   .btn-similar { background: none; border: 1px solid #222; color: #666; font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 4px; cursor: pointer; font-family: inherit; transition: all 0.2s; margin-top: 0.4rem; }
   .btn-similar:hover { border-color: #4fc3f7; color: #4fc3f7; }
@@ -1133,9 +1177,18 @@ SERVE_HTML = """<!DOCTYPE html>
           <button class="toggle-btn active" data-sort="score" onclick="switchSort('score')">pagerank</button>
           <button class="toggle-btn" data-sort="quality" onclick="switchSort('quality')">quality</button>
           <button class="toggle-btn" data-sort="smallweb" onclick="switchSort('smallweb')">smallweb</button>
+          <button class="toggle-btn" data-sort="taste" onclick="switchSort('taste')">taste</button>
           <button class="toggle-btn" data-sort="blended" onclick="switchSort('blended')">blended</button>
         </div>
       </div>
+    </div>
+
+    <div id="tastePanel" class="taste-panel" style="display:none">
+      <h3>taste classifier</h3>
+      <p>thumbs up/down discoveries to train a neural classifier that learns your taste. needs 3+ of each to train.</p>
+      <div class="taste-stats" id="tasteStats"></div>
+      <button class="btn-train" id="btnTrain" onclick="trainTaste()" disabled>train model</button>
+      <span id="tasteMsg" style="font-size:0.75rem;color:#666;margin-left:0.5rem"></span>
     </div>
 
     <div id="discoveriesContainer">
@@ -1236,6 +1289,8 @@ function renderDiscoveries(discoveries) {
     sorted.sort((a, b) => (b.quality || 0) - (a.quality || 0));
   } else if (currentSort === 'smallweb') {
     sorted.sort((a, b) => (b.smallweb_score || 0) - (a.smallweb_score || 0));
+  } else if (currentSort === 'taste') {
+    sorted.sort((a, b) => (b.taste_score || 0.5) - (a.taste_score || 0.5));
   } else if (currentSort === 'blended') {
     sorted.sort((a, b) => ((b.score || 0) * (b.quality || 1) * (b.smallweb_score || 0.5)) - ((a.score || 0) * (a.quality || 1) * (a.smallweb_score || 0.5)));
   }
@@ -1256,6 +1311,7 @@ function renderDiscoveries(discoveries) {
     const swColor = sw >= 0.7 ? '#81c784' : sw >= 0.4 ? '#ffb74d' : sw >= 0.15 ? '#ef5350' : '#666';
     const inbound = d.inbound_domains || 0;
     const outlink = d.outlink_score != null ? Math.round(d.outlink_score * 100) : '?';
+    const taste = d.taste_score != null ? d.taste_score : 0.5;
 
     // Anchor text pills (max 5)
     const anchors = (d.anchor_texts || []).slice(0, 5);
@@ -1270,7 +1326,11 @@ function renderDiscoveries(discoveries) {
           '<div class="discovery-url">' + escHtml(d.url) + '</div>' +
           (d.description ? '<div class="discovery-desc">' + escHtml(d.description.slice(0, 150)) + '</div>' : '') +
           anchorHtml +
-          '<button class="btn-similar" onclick="findSimilarFrom(\\'' + escJs(domain) + '\\')">find similar &rarr;</button>' +
+          '<div class="taste-btns">' +
+            '<button class="taste-btn' + (tasteLabels.positive.includes(d.url) ? ' positive' : '') + '" onclick="labelTaste(\\'' + escJs(d.url) + '\\', \\'positive\\', this)" title="good discovery">\u25B2</button>' +
+            '<button class="taste-btn' + (tasteLabels.negative.includes(d.url) ? ' negative' : '') + '" onclick="labelTaste(\\'' + escJs(d.url) + '\\', \\'negative\\', this)" title="not useful">\u25BC</button>' +
+            '<button class="btn-similar" onclick="findSimilarFrom(\\'' + escJs(domain) + '\\')">similar</button>' +
+          '</div>' +
         '</div>' +
         '<div style="text-align:right">' +
           '<div class="quality-bar-wrap" title="quality: ' + qPct + '%">' +
@@ -1282,6 +1342,7 @@ function renderDiscoveries(discoveries) {
             '<span class="sw-label" style="color:' + swColor + '">sw ' + sw.toFixed(2) + '</span>' +
           '</div>' +
           '<div class="sw-details">' + inbound + ' in · ' + outlink + '% small</div>' +
+          (taste !== 0.5 ? '<div class="taste-score">taste: ' + taste.toFixed(2) + '</div>' : '') +
           '<div class="score-badge">#' + (i + 1) + ' &middot; ' + d.score.toFixed(4) + '</div>' +
         '</div>' +
       '</div>' +
@@ -1391,8 +1452,103 @@ function escJs(s) {
   return s.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
 }
 
+// ── Taste System ──
+
+let tasteLabels = { positive: [], negative: [] };
+
+async function loadTasteStatus() {
+  try {
+    const res = await fetch(API + '/graphs/' + GRAPH_ID + '/taste');
+    const data = await res.json();
+    tasteLabels.positive = data.positive_urls || [];
+    tasteLabels.negative = data.negative_urls || [];
+
+    const panel = document.getElementById('tastePanel');
+    panel.style.display = 'block';
+
+    const stats = document.getElementById('tasteStats');
+    stats.innerHTML =
+      '<span class="taste-stat"><strong>' + tasteLabels.positive.length + '</strong> liked</span>' +
+      '<span class="taste-stat"><strong>' + tasteLabels.negative.length + '</strong> rejected</span>' +
+      (data.is_trained ? '<span class="taste-stat" style="color:#81c784">model trained</span>' : '');
+
+    const btn = document.getElementById('btnTrain');
+    btn.disabled = tasteLabels.positive.length < 3 || tasteLabels.negative.length < 3;
+  } catch (e) {
+    // taste not available, hide panel
+  }
+}
+
+async function labelTaste(url, label, btn) {
+  // Toggle: if already this label, remove it
+  const isAlreadyLabeled =
+    (label === 'positive' && tasteLabels.positive.includes(url)) ||
+    (label === 'negative' && tasteLabels.negative.includes(url));
+
+  const actualLabel = isAlreadyLabeled ? 'remove' : label;
+
+  try {
+    await fetch(API + '/graphs/' + GRAPH_ID + '/taste/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, label: actualLabel }),
+    });
+
+    // Update local state
+    tasteLabels.positive = tasteLabels.positive.filter(u => u !== url);
+    tasteLabels.negative = tasteLabels.negative.filter(u => u !== url);
+    if (actualLabel === 'positive') tasteLabels.positive.push(url);
+    if (actualLabel === 'negative') tasteLabels.negative.push(url);
+
+    // Update button states in this card
+    const card = btn.closest('.discovery');
+    card.querySelectorAll('.taste-btn').forEach(b => {
+      b.classList.remove('positive', 'negative');
+    });
+    if (actualLabel !== 'remove') {
+      btn.classList.add(actualLabel);
+    }
+
+    loadTasteStatus();
+  } catch (e) {
+    console.error('taste label error:', e);
+  }
+}
+
+async function trainTaste() {
+  const btn = document.getElementById('btnTrain');
+  const msg = document.getElementById('tasteMsg');
+  btn.disabled = true;
+  msg.textContent = 'training...';
+
+  try {
+    const res = await fetch(API + '/graphs/' + GRAPH_ID + '/taste/train', {
+      method: 'POST',
+    });
+    const data = await res.json();
+
+    if (data.trained) {
+      msg.textContent = 'trained! accuracy: ' + (data.accuracy * 100).toFixed(0) + '% (' + data.n_positive + '+ / ' + data.n_negative + '-)';
+      msg.style.color = '#81c784';
+      // Reload discoveries with taste scoring
+      discoveriesCache = { personalized: null, standard: null };
+      loadDiscoveries();
+    } else {
+      msg.textContent = data.error || 'training failed';
+      msg.style.color = '#ef5350';
+    }
+  } catch (e) {
+    msg.textContent = 'error: ' + e.message;
+    msg.style.color = '#ef5350';
+  }
+
+  btn.disabled = false;
+  loadTasteStatus();
+}
+
 // ── Init ──
 loadDiscoveries();
+loadTasteStatus();
 </script>
 </body>
 </html>"""
