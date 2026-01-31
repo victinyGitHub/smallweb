@@ -188,10 +188,13 @@ class WebGraph:
                 continue
             if url not in self.nodes:
                 continue
-            # Skip pages on the same domain as any seed (internal navigation)
             try:
                 domain = urlparse(url).netloc.lower()
+                # Skip pages on the same domain as any seed (internal navigation)
                 if domain in seed_domains:
+                    continue
+                # Skip major platform domains (not small web)
+                if is_platform_domain(domain):
                     continue
             except Exception:
                 pass
@@ -591,6 +594,91 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
         score *= 0.6
 
     return round(max(0.0, min(1.0, score)), 3)
+
+
+# ── Platform / Big-site detection ─────────────────────────────────────
+# Marginalia's key insight: the "small web" is defined by what it's NOT.
+# Major platforms, news sites, e-commerce, social media, and developer
+# infrastructure sites are not discoveries — they're the background noise
+# that the small web exists in contrast to.
+
+# Domains that are never interesting as discoveries.
+# These are platforms, not content. Finding "github.com" or "discord.gg"
+# in your crawl results is like finding "google.com" — it tells you nothing.
+PLATFORM_DOMAINS = {
+    # Social media & messaging
+    "twitter.com", "x.com", "facebook.com", "instagram.com", "tiktok.com",
+    "linkedin.com", "pinterest.com", "snapchat.com", "threads.net",
+    "discord.gg", "discord.com", "t.me", "telegram.org",
+    "mastodon.social", "joinmastodon.org",
+    # Code hosting (the platform, not user content)
+    "github.com", "gitlab.com", "codeberg.org", "bitbucket.org",
+    "gist.github.com", "raw.githubusercontent.com",
+    # Big tech
+    "google.com", "apple.com", "microsoft.com", "amazon.com",
+    "docs.google.com", "drive.google.com", "play.google.com",
+    "apps.apple.com", "support.apple.com",
+    # Publishing platforms (the platform itself)
+    "wordpress.org", "wordpress.com", "squarespace.com", "wix.com",
+    "ghost.org", "webflow.com", "carrd.co",
+    "medium.com", "substack.com", "blogger.com",
+    # Video/media platforms
+    "youtube.com", "youtu.be", "vimeo.com", "spotify.com",
+    "soundcloud.com", "twitch.tv",
+    # Commerce
+    "store.steampowered.com", "steampowered.com", "amazon.com",
+    "ebay.com", "etsy.com", "shopify.com",
+    # Developer tools/infrastructure
+    "npmjs.com", "npm.js.com", "pypi.org", "crates.io",
+    "stackoverflow.com", "stackexchange.com",
+    "gitbook.com", "www.gitbook.com", "readthedocs.org",
+    "netlify.com", "vercel.com", "heroku.com", "cloudflare.com",
+    # Major news/media (not small web)
+    "nytimes.com", "washingtonpost.com", "theguardian.com",
+    "bbc.co.uk", "bbc.com", "cnn.com", "reuters.com",
+    "bloomberg.com", "forbes.com", "techcrunch.com",
+    "wired.com", "arstechnica.com", "theverge.com",
+    "vice.com", "buzzfeed.com", "huffpost.com",
+    "metro.co.uk",
+    # Reference (not discoveries)
+    "en.wikipedia.org", "wikipedia.org", "wikidata.org",
+    "wikimedia.org", "archive.org", "web.archive.org",
+    # Misc platforms
+    "reddit.com", "news.ycombinator.com", "lobste.rs",
+    "patreon.com", "ko-fi.com", "buymeacoffee.com",
+    "anchor.fm", "gumroad.com",
+    "notion.so", "notion.site", "airtable.com",
+    "figma.com", "www.figma.com", "canva.com",
+}
+
+# Patterns that indicate a platform subdomain (e.g. *.github.io is fine,
+# but github.com itself is not)
+PLATFORM_PATTERNS = [
+    ".slack.com",
+    ".atlassian.net",
+    ".zendesk.com",
+    ".salesforce.com",
+    ".sharepoint.com",
+]
+
+
+def is_platform_domain(domain: str) -> bool:
+    """Check if a domain is a major platform (not small web)."""
+    domain = domain.lower()
+    # Exact match
+    if domain in PLATFORM_DOMAINS:
+        return True
+    # www. prefix
+    if domain.startswith("www.") and domain[4:] in PLATFORM_DOMAINS:
+        return True
+    # Without www.
+    if f"www.{domain}" in PLATFORM_DOMAINS:
+        return True
+    # Pattern match
+    for pattern in PLATFORM_PATTERNS:
+        if domain.endswith(pattern):
+            return True
+    return False
 
 
 def _get_domain(url: str) -> str:
