@@ -1,8 +1,8 @@
 # smallweb
 
-A small web discovery engine. Crawl niche corners of the web from seed URLs, build a local link graph, rank pages by local PageRank, and discover related sites.
+A personal web discovery engine. You give it seed URLs of sites you care about, it crawls outward N hops, builds a local link graph, and ranks discoveries using personalized PageRank multiplied by quality, smallweb-ness, and taste.
 
-Google indexes the whole web and ranks globally. **smallweb indexes YOUR web and ranks locally.**
+Google indexes the whole web and ranks globally. **Smallweb indexes YOUR web and ranks locally.**
 
 Graphs are portable JSON files — fork them, merge them, share them. Like git for web discovery.
 
@@ -22,57 +22,196 @@ python smallweb.py discover graph.json --top 20
 python smallweb.py html graph.json --output discoveries.html
 ```
 
-## How It Works
+## How It Works (and Why)
 
-1. **Seed** — start with URLs you care about (blogs, personal sites, community pages)
-2. **Crawl** — follow links N hops out, building a local link graph
-3. **Rank** — run PageRank on just your subgraph, not the whole internet
-4. **Discover** — see what bubbles up that you didn't already know about
+Smallweb combines seven distinct components. Each one encodes a specific belief about what makes a web page worth discovering. Together they produce a compound signal that no single metric could.
 
-### Crawler
+### 1. Domain-Diverse BFS Crawling
 
-The crawler is async (aiohttp) with concurrent fetching and two diversity mechanisms:
+**What:** The crawler follows links outward from your seeds using breadth-first search, but re-sorts the queue after each batch so that least-crawled domains get priority.
 
-- **Domain cap** (`--domain-cap 20`) — no single domain can consume more than N pages of your crawl budget. Prevents Wikipedia from eating everything.
-- **Domain diversity priority** — the BFS queue re-sorts each round by `(domain_count, depth)`, pulling from least-crawled domains first. Encourages broad exploration over deep indexing.
+**Why breadth over depth?** Following one site deep gives you that site's worldview. Spreading across domains finds the *connections between* worldviews. The interesting stuff lives at the intersections.
 
-The queue works as a breadth-first search with a diversity twist: after each batch of concurrent fetches, the queue is re-prioritized so domains you've barely touched get processed before domains you've already hit the cap on.
+**How it works:**
+- Async fetching via aiohttp (10 concurrent requests)
+- After each batch, the queue re-sorts by `(domain_count, depth)` — domains you've barely touched get processed first
+- Adaptive domain caps: seed domains get 2.5x the base cap (you chose them), hub domains linking to 5+ diverse sites get 1.5x, everything else gets the base cap (default 20)
+- Three layers of URL filtering: skip big tech/CDN domains, block 100+ platform domains from link-following (GitHub, Twitter, Medium, Wikipedia...), and regex patterns for spam (git paths, download bait, tracking params)
 
-### Ranking: PageRank × Quality × Smallweb Score
+The result is a graph that's broad and diverse rather than deep and narrow. You see more of the web's topology, not just one corner of it.
 
-Discovery ranking combines three independent signals:
+### 2. Personalized PageRank
 
-**PageRank** — local link authority on your subgraph, not the whole internet.
-- *Damping* (default `0.95`) — probability of following a link vs teleporting. Higher = more link-dependent.
-- *Personalized mode* — biases teleport toward seed pages, so discoveries are "near" your seeds in link-space.
-- Dangling nodes redistribute rank uniformly (standard PageRank).
+**What:** Standard PageRank finds what the whole graph thinks is important. Personalized PageRank finds what's important *from your corner of the web*.
 
-**Quality Score** — HTML cleanliness (0.0–1.0):
-- Penalizes excessive scripts, tracking domains, low text-to-HTML ratio, high link density.
-- A page with clean HTML and real content scores ~1.0. A tracker-heavy SPA scores ~0.3.
+**Why personalized?** Because the random walker keeps coming home to your seeds. Instead of teleporting to a random page when it gets bored, it teleports back to one of your seeds. This biases the ranking toward pages that are structurally close to what you already care about — discoveries that are "near" your seeds in link-space.
 
-**Smallweb Score** — data-driven "small-web-ness" per domain (0.0–1.0):
-- *Outlink profile*: what fraction of a domain's outlinks point to other domains **in our graph** (ecosystem integration)? Sites linking into our discovered ecosystem score higher than sites linking to random external stuff.
-- *Popularity bell curve*: peaks at 2–8 inbound domains (the sweet spot for small web). Drops off for orphans (0 inbound) and platforms (60+ inbound).
-- Combined: `popularity × (0.5 + 0.5 × outlink_profile)`
+**How it works:**
+- Iterative PageRank with damping factor 0.95 (high — follows links deep)
+- Teleport vector is non-uniform: weighted toward seed pages
+- Dangling nodes (pages with no outlinks) redistribute rank via the teleport vector
+- Raw PageRank spans ~4 orders of magnitude, so it's converted to percentile rank (0-1) before combining with other signals
+- Cached by `(damping, iterations, personalized)` key — tunable without re-crawling
 
-Final score: `pagerank × quality × smallweb_score`
+### 3. Quality Scoring (Marginalia-Inspired)
 
-### Co-Citation Similarity
+**What:** An additive penalty/bonus system that measures how "clean" a page's HTML is. Inspired by [Marginalia Search](https://search.marginalia.nu/)'s DocumentValuator.
 
-Find sites similar to any domain using co-citation analysis. Two domains are "similar" if they're linked FROM the same sources — cosine similarity on binary inbound-link vectors.
+**Why penalize trackers and scripts?** Not because they're morally bad, but because they correlate with content optimized for extraction rather than expression. A page with 14 tracking scripts, cookie consent popups, and affiliate links was built to capture attention. A page with clean HTML and real content was built to share ideas. The quality score is a proxy for editorial intent.
 
+**How it works:**
+
+Base score is derived from text-to-HTML ratio — the core signal.
+
+Penalties:
+- External scripts: -0.08 each
+- Known trackers (Google Analytics, Hotjar, Facebook Pixel): -0.15 each
+- Ad-tech (DoubleClick, Criteo, Taboola): -0.2 each
+- Cookie consent banners (OneTrust, Didomi): -0.1 each (capped at -0.3)
+- Affiliate links: -0.05 each (capped at -0.25)
+- AI-generated content patterns ("Ultimate Guide", "Key Takeaways"): -0.15 for 1-2 matches, -0.5 for 3+
+- High link density (>0.3 links/word): -0.2; link farm (>0.5): -0.4
+- Adblock circumvention: -0.6
+
+Bonuses (reward participation in the open web's plumbing):
+- Webmention support: +0.1
+- IndieAuth: +0.1
+- RSS/Atom feed: +0.05
+- Microformats (h-card, h-entry): +0.05
+
+Each page gets a detailed quality breakdown stored alongside its score, so you can see exactly why a page scored high or low.
+
+### 4. The Smallweb Bell Curve
+
+**What:** A per-domain "small-web-ness" score that peaks when a site is linked by a few people, not zero and not thousands.
+
+**Why a bell curve?** Zero inbound links means nobody found it — possibly dead or irrelevant. Sixty-plus inbound links means it's mainstream. The interesting zone is "a few people who care linked here" — that's editorial curation, not algorithmic popularity. The sweet spot is 3-8 inbound domains.
+
+**How it works:**
+
+Popularity component (inbound domain count → score):
+| Inbound Domains | Score | Why |
+|----------------|-------|-----|
+| 0 | 0.4 | Nobody found it |
+| 1-2 | 0.7 | Getting noticed |
+| 3-8 | 1.0 | Sweet spot — curated, not mainstream |
+| 9-15 | 0.6 | Getting popular |
+| 16-30 | 0.3 | Mainstream |
+| 31-60 | 0.15 | Big site |
+| 61+ | 0.05 | Platform-scale |
+
+Outlink profile component:
+- `ecosystem_fraction`: what fraction of outlinks point to other domains in the graph? Sites linking into the discovered ecosystem score higher than sites linking to random external stuff
+- `non_platform_fraction`: what fraction avoid linking to platforms?
+
+Combined: `popularity × (0.5 + 0.5 × outlink_score)`. Known platforms (GitHub, Twitter, etc.) are capped at 0.15 regardless.
+
+### 5. Anchor Texts as First-Class Data
+
+**What:** The crawler stores the visible text of every link pointing to a page — what other sites call it.
+
+**Why?** Self-description is marketing, but how *others* describe you is reputation. It's the difference between your LinkedIn bio and what your coworkers actually say about you. A page's title says "About Us". The anchor texts from sites linking to it say "incredible writeup on local-first software" or "great resource for pixel art". Anchor texts are the web's word-of-mouth.
+
+**How it works:**
+- During crawling, every `<a>` tag's visible text is extracted and stored on the *target* node (max 20 per node)
+- Anchor texts are searchable via all three search backends
+- In the frontend, they appear as pills on each discovery card
+- FTS5 weights anchor texts at 8x (nearly as much as titles at 10x)
+
+### 6. Co-Citation Similarity
+
+**What:** Two domains are "similar" if they're linked FROM the same sources. Not because they have similar content — because the same people think they're worth linking to.
+
+**Why is this the killer feature?** Because it reveals editorial communities invisible to keyword search. If three independent niche blogs all link to the same obscure site, those bloggers are functioning as a distributed curation network. They're performing editorial judgment that no algorithm could replicate. Co-citation surfaces these hidden networks.
+
+**How it works:**
+- Each domain gets a binary inbound-link vector (which domains in the graph link to it)
+- Cosine similarity: `|inbound(A) ∩ inbound(B)| / sqrt(|inbound(A)| × |inbound(B)|)`
+- Single-target mode: "find sites similar to X"
+- All-pairs mode: "find the most similar pair of sites in the whole graph"
+- Minimum shared sources threshold (default 2) to filter noise
+
+### 7. The Fork/Promote Loop
+
+**What:** Crawl → discover → promote the best discoveries to seeds → re-crawl from expanded seeds → discover deeper.
+
+**Why iterative?** Because the best seeds for round 2 are the discoveries from round 1. The graph teaches you where to look next. Each iteration pushes further into the long tail of the web, following the editorial networks you've uncovered.
+
+**How it works:**
 ```bash
-# Find sites similar to a domain
-curl http://localhost:8420/api/graphs/my-graph/similar?target=wiki.xxiivv.com&top=10
+# Start with seeds you know
+python smallweb.py crawl "https://seed1.com,https://seed2.com" --name round1
 
-# Get top similar pairs across the whole graph
-curl http://localhost:8420/api/graphs/my-graph/similarities?min_shared=2&top=20
+# See what bubbles up
+python smallweb.py discover round1.json --top 10
+
+# Promote top 5 discoveries to seeds, add a new one, re-crawl
+python smallweb.py fork round1.json --name round2 \
+  --promote-top 5 --add-seeds "https://newdiscovery.com" \
+  --recrawl --hops 2 --max-pages 500
 ```
 
-### Anchor Text
+Forked graphs track provenance: `forked_from`, `forked_at`, `seeds_promoted`, `seeds_added`. You can trace the evolution of your discovery graph over time.
 
-The crawler captures anchor text (the visible text of links). This tells you how other sites describe a page, which is often more useful than the page's own title/description.
+### How They Multiply Together
+
+The final discovery score:
+
+```
+score = PageRank^exp × Quality^exp × Smallweb^exp × taste_factor × fetched_boost
+```
+
+Each component filters a different dimension:
+- **PageRank** finds structural importance (what the link graph thinks matters)
+- **Quality** filters noise (removes tracker-heavy, ad-laden, AI-slop pages)
+- **Smallweb score** keeps it niche (penalizes mainstream, rewards the curated middle)
+- **Taste** personalizes it (learns from your thumbs up/down)
+- **Co-citation** reveals the hidden network (editorial communities, not keywords)
+
+A page needs to pass ALL these filters to rank high. It needs to be structurally important in your subgraph, cleanly built, linked by a few discerning people, and match your taste. That conjunction is what makes the discoveries feel hand-picked rather than algorithmically generated.
+
+The exponents are tunable per-graph via the scoring config system, with named presets:
+- **default** — balanced across all signals
+- **indie purist** — smallweb^1.5, quality^1.3, doubled IndieWeb bonuses
+- **quality focused** — quality^1.5, pagerank^0.7
+- **broad discovery** — pagerank^1.3, quality^0.7, platform cap raised
+
+---
+
+## Taste Model
+
+Train a personal classifier from thumbs up/down on discoveries:
+
+- Uses sentence-transformers (`all-MiniLM-L6-v2`) to embed each page's title + description + anchors
+- Logistic regression learns your taste from labeled examples
+- Needs at least 3 positive + 3 negative labels to train
+- Taste score is multiplied into the final ranking formula
+
+Label pages via the web UI (thumbs up/down buttons on discovery cards) or the API.
+
+## Search
+
+Three pluggable search backends:
+
+| Backend | Best For | How It Works |
+|---------|----------|-------------|
+| **Fuzzy** | Quick scans | In-memory substring + token matching, bonuses for title/anchor hits |
+| **FTS5** | Keyword search | SQLite FTS5 with porter stemming, BM25 ranking, weighted fields (title 10x, anchors 8x, description 5x) |
+| **Semantic** | Conceptual queries | Sentence-transformer embeddings, cosine similarity. Finds related pages without keyword overlap |
+
+```bash
+# Search across graphs (auto-selects best graph)
+python search.py search "malleable software" --top 10
+
+# Specify backend
+python search.py fts "local-first" --graph xi-malleable-v3 --top 20
+
+# Semantic search
+python search.py semantic "tools for thinking" --top 10
+
+# List all graphs
+python search.py graphs
+```
 
 ## Commands
 
@@ -83,7 +222,7 @@ python smallweb.py crawl <urls_or_file> [--hops N] [--max-pages N] [--domain-cap
 # Show PageRank of all pages
 python smallweb.py rank <graph.json> [--top N] [--damping F] [--iterations N]
 
-# Show top discoveries (non-seed pages ranked by PageRank)
+# Show top discoveries (non-seed pages ranked by combined score)
 python smallweb.py discover <graph.json> [--top N] [--damping F] [--iterations N]
 
 # Fork a graph with new params, seed promotion, optional re-crawl
@@ -105,86 +244,43 @@ python smallweb.py serve <graph.json> [--port 8080]
 python smallweb.py html <graph.json> [--output page.html]
 ```
 
-## PageRank Tuning
+## Web Server & API
 
-You can experiment with different PageRank parameters without re-crawling:
-
-```bash
-# Default: damping=0.95
-python smallweb.py discover graph.json --top 10
-
-# Lower damping spreads rank more evenly (less link-dependent)
-python smallweb.py discover graph.json --top 10 --damping 0.5
-
-# Higher damping amplifies link authority
-python smallweb.py discover graph.json --top 10 --damping 0.99
-
-# Compare rankings side by side
-python smallweb.py rank graph.json --top 10 --damping 0.85
-python smallweb.py rank graph.json --top 10 --damping 0.95
-```
-
-## Seeds
-
-Seeds can be:
-- **Comma-separated URLs**: `"https://site1.com,https://site2.com"`
-- **A text file** with one URL per line
-- **An existing graph.json** — uses its seeds as starting points
-
-## Forking
-
-Forking creates a new graph from an existing one. You can change PageRank parameters, promote discoveries to seeds, add new seeds, and optionally re-crawl.
-
-### Quick param change (no re-crawl)
+`server.py` runs the web interface and REST API.
 
 ```bash
-# Fork with different damping — instant, no network requests
-python smallweb.py fork graph.json --name "high-damping" --damping 0.99
+pip install aiohttp beautifulsoup4 sentence-transformers scikit-learn
+python server.py --port 8420
 ```
 
-### Promote discoveries to seeds
+### API Endpoints
 
-```bash
-# Take the top 5 discovered pages and make them seeds in the fork
-python smallweb.py fork graph.json --name "expanded" --promote-top 5
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/graphs` | List all saved graphs |
+| `GET` | `/api/graphs/{id}` | Get graph JSON |
+| `GET` | `/api/graphs/{id}/html` | Get rendered HTML |
+| `GET` | `/api/graphs/{id}/discoveries` | Ranked discoveries (`?top=N&personalized=true&sort=overall`) |
+| `GET` | `/api/graphs/{id}/similar` | Co-cited similar domains (`?target=DOMAIN&top=N`) |
+| `GET` | `/api/graphs/{id}/similarities` | Top similar pairs (`?min_shared=N&top=N`) |
+| `GET` | `/api/graphs/{id}/config` | Get scoring config |
+| `PUT` | `/api/graphs/{id}/config` | Update scoring config |
+| `GET` | `/api/graphs/{id}/config/presets` | List available presets |
+| `POST` | `/api/graphs/{id}/config/preset` | Apply a named preset |
+| `POST` | `/api/graphs/{id}/taste/label` | Add taste label (thumbs up/down) |
+| `POST` | `/api/graphs/{id}/taste/train` | Train taste model |
+| `POST` | `/api/crawl` | Start a new crawl |
+| `GET` | `/api/crawl/{id}` | Check crawl status |
+| `POST` | `/api/graphs/{id}/fork` | Fork a graph |
 
-This is the core loop: crawl → discover → promote the best discoveries → re-crawl from expanded seeds → discover deeper.
+### Frontend
 
-### Add custom seeds + re-crawl
+**Homepage** (`index.html`) — graph cards, crawl form, fork modal. No framework, no build step.
 
-```bash
-# Add new seeds and re-crawl the whole thing
-python smallweb.py fork graph.json --name "with-new-seeds" \
-  --add-seeds "https://newsite1.com,https://newsite2.com" \
-  --promote-top 3 \
-  --recrawl --hops 2 --max-pages 500 --domain-cap 20
-```
-
-### Provenance tracking
-
-Forked graphs record where they came from:
-
-```json
-{
-  "metadata": {
-    "name": "expanded",
-    "forked_from": "my-web-corner",
-    "forked_at": "2026-01-30T12:00:00",
-    "forked_by": "xi",
-    "seeds_promoted": ["https://discovered-site.com", "https://another.com"]
-  }
-}
-```
-
-## Merging
-
-```bash
-# Combine two discovery graphs
-python smallweb.py merge my-graph.json friend-graph.json --output combined.json
-```
-
-Merging unions the nodes, edges, and seeds from both graphs. The result records both parent graphs in its metadata.
+**Graph detail page** (tabbed):
+- **Discoveries** — ranked cards with quality bars, smallweb indicators, anchor text pills, score breakdown popups, taste buttons, algorithm tuning sliders with live preview
+- **Similarity** — co-citation explorer, search for similar domains, auto-computed top pairs
+- **Seeds & Domains** — seed list, clickable domain tag cloud
 
 ## Graph Format
 
@@ -196,7 +292,8 @@ A single portable JSON file:
     "name": "my-web-corner",
     "created_at": "2026-01-30T01:57:24",
     "version": "0.1.0",
-    "domain_cap": 20
+    "domain_cap": 20,
+    "damping": 0.95
   },
   "seeds": ["https://wiki.xxiivv.com", "https://100r.co"],
   "nodes": {
@@ -205,7 +302,10 @@ A single portable JSON file:
       "description": "...",
       "crawled_at": "2026-01-30T01:57:25",
       "depth": 0,
-      "domain": "wiki.xxiivv.com"
+      "domain": "wiki.xxiivv.com",
+      "quality": 0.92,
+      "quality_breakdown": { "base": 0.85, "penalties": {...}, "bonuses": {...} },
+      "anchor_texts": ["hundred rabbits wiki", "xxiivv — personal wiki"]
     }
   },
   "edges": {
@@ -214,107 +314,37 @@ A single portable JSON file:
 }
 ```
 
-## Web Server & Frontend
+Sidecar files per graph:
+- `{id}.taste.json` — taste labels (positive/negative URL lists)
+- `{id}.taste.pkl` — trained taste model + cached embeddings
+- `{id}.config.json` — scoring config overrides (only non-default values)
+- `{id}.search_embeddings.npz` — cached semantic search vectors
 
-`server.py` is an optional API server for hosting smallweb as a web app. `index.html` is the frontend with graph browsing and fork controls.
+## MCP Integration
 
-### Running
+An MCP server (`mcp_server.py`) exposes 8 tools for Claude CLI integration, enabling autonomous research loops:
 
-```bash
-pip install aiohttp beautifulsoup4
-python server.py --port 8420
-# Open http://localhost:8420 in your browser
-```
+1. Seed discovery (find niche blogs via web search)
+2. Initial crawl (2 hops, 200-300 pages)
+3. Co-citation analysis (find hidden gems)
+4. Fork and go deeper (promote discoveries as seeds)
+5. Synthesize results
 
-### API Endpoints
+## Seeds
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/api/graphs` | List all saved graphs |
-| `GET` | `/api/graphs/{id}` | Get graph JSON |
-| `GET` | `/api/graphs/{id}/html` | Get rendered HTML |
-| `GET` | `/api/graphs/{id}/discoveries` | Get discoveries (`?top=N&personalized=true/false`) |
-| `GET` | `/api/graphs/{id}/similar` | Find similar domains (`?target=DOMAIN&top=N`) |
-| `GET` | `/api/graphs/{id}/similarities` | Top similar pairs (`?min_shared=N&top=N`) |
-| `POST` | `/api/crawl` | Start a new crawl |
-| `GET` | `/api/crawl/{id}` | Check crawl status |
-| `POST` | `/api/graphs/{id}/fork` | Fork a graph |
-
-### Fork API
-
-```bash
-curl -X POST http://localhost:8420/api/graphs/my-graph/fork \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "expanded",
-    "promote_top": 5,
-    "add_seeds": ["https://newsite.com"],
-    "damping": 0.95,
-    "iterations": 50,
-    "recrawl": true,
-    "hops": 2,
-    "max_pages": 500,
-    "domain_cap": 20
-  }'
-```
-
-When `recrawl` is `false` (default), the fork is instant — just a copy with new params. When `true`, it spawns an async crawl from all seeds (including promoted ones).
-
-### Frontend
-
-**Homepage** (`index.html`):
-- Graph cards — browse all saved graphs with stats
-- Crawl form — start new crawls from the browser
-- Fork modal — fork with param changes, seed promotion, re-crawl
-
-**Graph detail page** (tabbed interface):
-- **Discoveries tab** — ranked discovery cards with:
-  - Quality bar (green/yellow/red)
-  - Smallweb score indicator (dot + inbound count + outlink %)
-  - Anchor text pills (how other sites describe this page)
-  - "Find similar" button on each card
-  - Toggle: personalized vs standard PageRank
-  - Sort: pagerank / quality / smallweb / blended
-- **Similarity tab** — co-citation explorer:
-  - Search box to find sites similar to any domain
-  - Auto-computed top similar pairs
-  - Click any domain to explore its neighborhood
-- **Seeds & domains tab** — clickable domain tags, seed list
-
-### Discovery Response Format
-
-Each discovery in the API includes:
-
-```json
-{
-  "url": "https://example.com/page",
-  "score": 0.00028,
-  "title": "Page Title",
-  "description": "...",
-  "domain": "example.com",
-  "quality": 0.85,
-  "anchor_texts": ["cool page", "interesting read"],
-  "smallweb_score": 0.7,
-  "inbound_domains": 3,
-  "outlink_score": 0.85,
-  "popularity_score": 1.0
-}
-```
-
-## Philosophy
-
-- **Your web, your rank** — you choose the seeds, you control what gets discovered
-- **Transparent** — the ranking algorithm is ~50 lines of PageRank, not a black box
-- **Portable** — everything is a JSON file you can move, share, version control
-- **No tracking** — runs locally, no analytics, no profiles, no ads
-- **Forkable** — like git repos, discovery graphs can be forked, modified, merged
-- **Iterative** — crawl → discover → promote → re-crawl. each cycle finds deeper corners
+Seeds can be:
+- **Comma-separated URLs**: `"https://site1.com,https://site2.com"`
+- **A text file** with one URL per line
+- **An existing graph.json** — uses its seeds as starting points
 
 ## Dependencies
 
 - Python 3.8+
-- `aiohttp` — async HTTP client for crawling
+- `aiohttp` — async HTTP client for crawling and serving
 - `beautifulsoup4` — HTML parsing
+- `sentence-transformers` — embeddings for taste model and semantic search (optional)
+- `scikit-learn` — logistic regression for taste classifier (optional)
+- `numpy` — vector operations (optional, comes with sentence-transformers)
 
 ## License
 

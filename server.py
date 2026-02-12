@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from smallweb import WebGraph, crawl, render_html
 from taste import TasteModel
+from scoring_config import load_config, save_config, with_overrides, apply_preset, DEFAULTS as CONFIG_DEFAULTS
 
 GRAPHS_DIR = Path("/var/www/arg/mains.in.net/smallweb/graphs")
 STATIC_DIR = Path("/var/www/arg/mains.in.net/smallweb")
@@ -30,6 +31,12 @@ active_crawls = {}  # id -> {status, progress, name, seeds, ...}
 # Cache taste models per graph (avoids reloading on every request)
 _taste_cache = {}  # graph_id -> TasteModel
 
+# Cache scoring configs per graph
+_config_cache = {}  # graph_id -> dict
+
+# Cache loaded graph objects (avoids re-parsing JSON + recomputing PageRank)
+_graph_cache = {}  # graph_id -> (mtime, WebGraph)
+
 def _get_taste_model(graph_id: str, graph: WebGraph = None) -> TasteModel:
     """Get or create a TasteModel for a graph."""
     if graph_id not in _taste_cache:
@@ -38,6 +45,84 @@ def _get_taste_model(graph_id: str, graph: WebGraph = None) -> TasteModel:
     elif graph is not None:
         _taste_cache[graph_id].graph = graph
     return _taste_cache[graph_id]
+
+
+def _get_graph(graph_id: str) -> WebGraph:
+    """Get or load a cached graph. Auto-invalidates if file changed."""
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    mtime = path.stat().st_mtime
+    if graph_id in _graph_cache:
+        cached_mtime, cached_graph = _graph_cache[graph_id]
+        if cached_mtime == mtime:
+            return cached_graph
+    graph = WebGraph.load(str(path))
+    _graph_cache[graph_id] = (mtime, graph)
+    return graph
+
+
+def _get_config(graph_id: str) -> dict:
+    """Get or load scoring config for a graph."""
+    if graph_id not in _config_cache:
+        graph_path = str(GRAPHS_DIR / f"{graph_id}.json")
+        _config_cache[graph_id] = load_config(graph_path)
+    return _config_cache[graph_id]
+
+
+async def handle_get_config(request):
+    """Get scoring config for a graph (merged with defaults)."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+    cfg = _get_config(graph_id)
+    return web.json_response(cfg)
+
+
+async def handle_put_config(request):
+    """Save scoring config overrides for a graph."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+    try:
+        overrides = await request.json()
+    except:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    # Merge overrides onto current config
+    cfg = _get_config(graph_id)
+    new_cfg = with_overrides(cfg, overrides)
+    # Save and update cache
+    save_config(str(path), new_cfg)
+    _config_cache[graph_id] = new_cfg
+    return web.json_response({"ok": True, "config": new_cfg})
+
+
+async def handle_config_presets(request):
+    """List available presets."""
+    graph_id = request.match_info["id"]
+    cfg = _get_config(graph_id)
+    presets = cfg.get("presets", CONFIG_DEFAULTS.get("presets", {}))
+    return web.json_response({"presets": presets})
+
+
+async def handle_apply_preset(request):
+    """Apply a named preset to a graph's config."""
+    graph_id = request.match_info["id"]
+    path = GRAPHS_DIR / f"{graph_id}.json"
+    if not path.exists():
+        return web.json_response({"error": "graph not found"}, status=404)
+    try:
+        body = await request.json()
+    except:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    preset_name = body.get("preset", "")
+    cfg = _get_config(graph_id)
+    new_cfg = apply_preset(cfg, preset_name)
+    save_config(str(path), new_cfg)
+    _config_cache[graph_id] = new_cfg
+    return web.json_response({"ok": True, "config": new_cfg})
 
 
 async def handle_index(request):
@@ -52,8 +137,8 @@ async def handle_list_graphs(request):
     """List all saved graphs."""
     graphs = []
     for f in sorted(GRAPHS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        # Skip taste label files and model files
-        if f.stem.endswith(".taste") or f.suffix != ".json":
+        # Skip taste label files, model files, and config files
+        if f.stem.endswith(".taste") or f.stem.endswith(".config") or f.suffix != ".json":
             continue
         try:
             with open(f) as fp:
@@ -298,58 +383,153 @@ async def handle_fork(request):
 
 
 async def handle_discoveries(request):
-    """Get discoveries for a graph."""
+    """Get discoveries for a graph.
+
+    Returns the union of top-N results from each sort category (overall,
+    pagerank, quality, smallweb, taste) so the frontend can sort by any
+    signal without missing pages that rank high in one dimension but low
+    in the default blended sort.
+    """
     graph_id = request.match_info["id"]
     path = GRAPHS_DIR / f"{graph_id}.json"
     if not path.exists():
         return web.json_response({"error": "graph not found"}, status=404)
 
     try:
-        top = int(request.query.get("top", 30))
+        top = int(request.query.get("top", 50))
         damping = float(request.query.get("damping", 0.95))
         iterations = int(request.query.get("iterations", 50))
         personalized = request.query.get("personalized", "true").lower() != "false"
-        graph = WebGraph.load(str(path))
+        graph = _get_graph(graph_id)
+
+        # Load scoring config, with optional per-request overrides
+        cfg = _get_config(graph_id)
+        config_param = request.query.get("config", "")
+        if config_param:
+            try:
+                import urllib.parse
+                overrides = json.loads(urllib.parse.unquote(config_param))
+                cfg = with_overrides(cfg, overrides)
+            except (json.JSONDecodeError, ValueError):
+                pass  # bad config param, use saved config
 
         # Load taste model if trained
         taste = _get_taste_model(graph_id, graph)
         use_taste = taste.is_trained
 
+        # Get a large pool of discoveries so we can pick top-N per category.
+        # We request 5x the per-category limit to have enough candidates.
+        pool_size = top * 5
+
         # Run discoveries in a thread to avoid blocking the event loop
-        # (taste scoring loads the embedding model which is CPU-intensive)
         import concurrent.futures
         loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
+        with concurrent.futures.ThreadPoolExecutor() as pool_exec:
             discoveries = await loop.run_in_executor(
-                pool,
+                pool_exec,
                 lambda: graph.discoveries(
-                    top_n=top, damping=damping, iterations=iterations,
+                    top_n=pool_size, damping=damping, iterations=iterations,
                     personalized=personalized,
                     taste_model=taste if use_taste else None,
+                    cfg=cfg,
                 )
             )
 
-        results = []
+        # Convert to dicts
+        all_items = []
         for url, score, node in discoveries:
-            results.append({
+            pr_pct = node.get("pagerank_pct", 0)
+            q = node.get("quality", 0.5)
+            sw = node.get("smallweb_score", 0.5)
+            taste = node.get("taste_score", 0.5)
+            q_measured = "quality" in node
+
+            # Build the overall score breakdown — reflects current config exponents
+            f_cfg = cfg.get("formula", {})
+            pr_exp = f_cfg.get("pagerank_exp", 1.0)
+            q_exp = f_cfg.get("quality_exp", 1.0)
+            sw_exp = f_cfg.get("smallweb_exp", 1.0)
+            taste_base = f_cfg.get("taste_base", 0.5)
+            taste_weight = f_cfg.get("taste_weight", 0.5)
+            fetched_boost_val = f_cfg.get("fetched_boost", 0.2)
+
+            def _exp_str(name, exp):
+                if exp == 1.0:
+                    return name
+                return f"{name}^{exp}"
+
+            formula_parts = [_exp_str("pagerank", pr_exp), _exp_str("quality", q_exp), _exp_str("smallweb", sw_exp)]
+            if use_taste:
+                formula_parts.append(f"({taste_base} + {taste_weight} × taste)")
+            if not q_measured:
+                formula_parts.append("fetched_boost")
+            formula_str = " × ".join(formula_parts)
+
+            overall_breakdown = {
+                "formula": formula_str,
+                "components": {
+                    "pagerank_pct": {"value": round(pr_pct, 4), "exp": pr_exp, "why": "How well-connected this page is in the link graph, as a percentile rank (0-1). Higher = more pages link to it, especially authoritative ones."},
+                    "quality": {"value": round(q, 3), "measured": q_measured, "exp": q_exp, "why": "HTML cleanliness score. Penalizes trackers, ads, bloat. Rewards IndieWeb signals. '?' means we haven't fetched this page yet."},
+                    "smallweb": {"value": round(sw, 3), "exp": sw_exp, "why": "Is this domain part of the small web? Combines popularity (too popular = platform) and outlink profile (links to other small sites = good)."},
+                },
+            }
+            if use_taste:
+                overall_breakdown["components"]["taste"] = {"value": round(taste, 3), "why": "Neural taste score trained on your upvotes/downvotes. 0.5 = neutral, 1.0 = strong match."}
+            if not q_measured:
+                overall_breakdown["components"]["fetched_boost"] = {"value": fetched_boost_val, "why": "This page hasn't been crawled yet, so quality is estimated. Fetched pages get priority since we actually measured their HTML."}
+
+            item = {
                 "url": url,
                 "score": score,
+                "score_breakdown": overall_breakdown,
+                "pagerank": node.get("pagerank", 0),
+                "pagerank_pct": pr_pct,
                 "title": node.get("title", ""),
                 "description": node.get("description", ""),
                 "domain": node.get("domain", ""),
-                "quality": node.get("quality", 1.0),
+                "quality": q,
+                "quality_measured": q_measured,
+                "quality_breakdown": node.get("quality_breakdown"),  # detailed HTML analysis (if fetched)
                 "anchor_texts": node.get("anchor_texts", []),
-                "smallweb_score": node.get("smallweb_score", 0.5),
+                "smallweb_score": sw,
                 "inbound_domains": node.get("inbound_domains", 0),
                 "outlink_score": node.get("outlink_score", 0.5),
                 "popularity_score": node.get("popularity_score", 0.5),
-                "taste_score": node.get("taste_score", 0.5),
-            })
+                "taste_score": taste,
+            }
+            all_items.append(item)
+
+        # Build union of top-N from each sort category
+        seen_urls = set()
+        results = []
+
+        def add_top(items, key, n):
+            sorted_items = sorted(items, key=key, reverse=True)
+            for item in sorted_items[:n]:
+                if item["url"] not in seen_urls:
+                    seen_urls.add(item["url"])
+                    results.append(item)
+
+        # Top by overall blended score (already sorted this way)
+        add_top(all_items, lambda d: d["score"], top)
+        # Top by raw pagerank
+        add_top(all_items, lambda d: d["pagerank"], top)
+        # Top by quality (only measured pages matter)
+        add_top(all_items, lambda d: d["quality"] if d["quality_measured"] else -1, top)
+        # Top by smallweb score
+        add_top(all_items, lambda d: d["smallweb_score"], top)
+        # Top by taste score
+        if use_taste:
+            add_top(all_items, lambda d: d["taste_score"], top)
+
+        # Sort final results by blended score for default display order
+        results.sort(key=lambda d: d["score"], reverse=True)
 
         return web.json_response({
             "discoveries": results,
             "total": len(results),
             "taste_active": use_taste,
+            "config": cfg,
         })
     except Exception as e:
         import traceback
@@ -530,6 +710,10 @@ def create_app():
     app.router.add_get("/api/graphs/{id}", handle_get_graph)
     app.router.add_get("/api/graphs/{id}/html", handle_graph_html)
     app.router.add_get("/api/graphs/{id}/discoveries", handle_discoveries)
+    app.router.add_get("/api/graphs/{id}/config", handle_get_config)
+    app.router.add_put("/api/graphs/{id}/config", handle_put_config)
+    app.router.add_get("/api/graphs/{id}/config/presets", handle_config_presets)
+    app.router.add_post("/api/graphs/{id}/config/preset", handle_apply_preset)
     app.router.add_get("/api/graphs/{id}/similar", handle_similar)
     app.router.add_get("/api/graphs/{id}/similarities", handle_similarities)
     app.router.add_post("/api/graphs/{id}/fork", handle_fork)

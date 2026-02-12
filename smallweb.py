@@ -103,7 +103,15 @@ class WebGraph:
         rank higher than generically popular sites.
 
         Returns {url: score} sorted by score descending.
+        Caches result — same params on same graph returns cached value.
         """
+        # Simple memoization: cache result keyed by (damping, iterations, personalized)
+        cache_key = (damping, iterations, personalized)
+        if not hasattr(self, '_pagerank_cache'):
+            self._pagerank_cache = {}
+        if cache_key in self._pagerank_cache:
+            return self._pagerank_cache[cache_key]
+
         all_urls = set(self.nodes.keys())
         if not all_urls:
             return {}
@@ -151,12 +159,15 @@ class WebGraph:
             scores = new_scores
 
         result = {urls[i]: scores[i] for i in range(n)}
-        return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
+        result = dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
+        self._pagerank_cache[cache_key] = result
+        return result
 
     def discoveries(self, top_n: int = 20, damping: float = 0.95,
                      iterations: int = 50, use_quality: bool = True,
                      personalized: bool = True,
-                     taste_model=None) -> List[Tuple[str, float, dict]]:
+                     taste_model=None,
+                     cfg: dict = None) -> List[Tuple[str, float, dict]]:
         """
         Return top-ranked pages that are NOT seeds.
         These are the things you discovered by crawling outward.
@@ -191,7 +202,19 @@ class WebGraph:
                 pass
 
         # Compute data-driven smallweb scores per domain
-        sw_scores = self._smallweb_scores() if use_quality else {}
+        sw_scores = self._smallweb_scores(cfg=cfg) if use_quality else {}
+
+        # Normalize pagerank to percentiles (0-1) so it doesn't dominate
+        # quality/smallweb signals. Raw pagerank spans ~4 orders of magnitude
+        # while quality spans ~10x, so linear multiplication lets pagerank
+        # completely drown out quality. Percentile normalization gives each
+        # signal roughly equal weight in the final blend.
+        if use_quality:
+            sorted_pr = sorted(ranks.values())
+            pr_rank_map = {}
+            n_total = len(sorted_pr)
+            for i, v in enumerate(sorted_pr):
+                pr_rank_map[v] = (i + 1) / n_total  # percentile 0-1
 
         results = []
         for url, score in ranks.items():
@@ -207,10 +230,36 @@ class WebGraph:
             except Exception:
                 domain = ""
 
+            # Always store raw pagerank for the API
+            self.nodes[url]["pagerank"] = score
+
             if use_quality:
-                q = self.nodes[url].get("quality", 1.0)
+                # Percentile-normalized pagerank (0-1 range)
+                pr_norm = pr_rank_map.get(score, 0.5)
+                self.nodes[url]["pagerank_pct"] = round(pr_norm, 4)
+
+                # Only fetched pages have a "quality" key (set during crawl).
+                # With 35:1 unfetched-to-fetched ratio, unfetched pages flood
+                # the rankings even at 0.5 quality. We apply a fetched bonus
+                # (1.0 for measured pages, 0.2 for unmeasured) so that pages
+                # we actually crawled and scored get priority.
+                if "quality" in self.nodes[url]:
+                    q = self.nodes[url]["quality"]
+                    fetched_boost = 1.0
+                else:
+                    q = 0.5
+                    f_cfg = (cfg or {}).get("formula", {})
+                    fetched_boost = f_cfg.get("fetched_boost", 0.2)
                 sw = sw_scores.get(domain, {}).get("smallweb_score", 0.5)
-                final_score = score * q * sw
+
+                # Blend with exponents from config.
+                # Higher exponent = that signal matters more (amplifies differences).
+                # Default 1.0 = linear (original behavior).
+                f_cfg = (cfg or {}).get("formula", {})
+                pr_exp = f_cfg.get("pagerank_exp", 1.0)
+                q_exp = f_cfg.get("quality_exp", 1.0)
+                sw_exp = f_cfg.get("smallweb_exp", 1.0)
+                final_score = (pr_norm ** pr_exp) * (q ** q_exp) * (sw ** sw_exp) * fetched_boost
 
                 # Store metadata on the node for API/frontend access
                 sw_data = sw_scores.get(domain, {})
@@ -235,11 +284,14 @@ class WebGraph:
             taste_scores = taste_model.score_all(candidate_urls)
 
             # Re-score with taste
+            f_cfg = (cfg or {}).get("formula", {})
+            taste_base = f_cfg.get("taste_base", 0.5)
+            taste_weight = f_cfg.get("taste_weight", 0.5)
             rescored = []
             for url, score, node in candidates:
                 taste = taste_scores.get(url, 0.5)
                 node["taste_score"] = taste
-                new_score = score * (0.5 + 0.5 * taste)
+                new_score = score * (taste_base + taste_weight * taste)
                 rescored.append((url, new_score, node))
 
             rescored.sort(key=lambda x: x[1], reverse=True)
@@ -261,52 +313,74 @@ class WebGraph:
                     inbound[to_domain].add(from_domain)
         return inbound
 
-    def _outlink_profile(self, domain: str, graph_domains: Set[str] = None) -> float:
+    def _build_outlink_profiles(self, graph_domains: Set[str] = None) -> Dict[str, dict]:
         """
-        Compute an "outlink profile" score for a domain (0.0 to 1.0).
+        Pre-compute raw outlink data for ALL domains in one pass over edges.
 
-        Uses two signals:
-        1. What fraction of outlinks point to domains IN our graph (ecosystem links)
-        2. What fraction of outlinks point to known platforms (platform links)
+        Returns dict of domain -> {
+            ecosystem_fraction: float,   # fraction of outlinks pointing into graph
+            non_platform_fraction: float, # fraction NOT pointing to platforms
+            has_data: bool,              # whether domain has any outlinks
+        }
 
-        A site that links to other sites we've discovered is more "part of our web."
-        A site that links entirely outside our graph is likely a platform or unrelated.
-
-        Returns 1.0 for sites deeply integrated in our graph's ecosystem.
-        Returns 0.0 for sites that only link to platforms/outside our graph.
-        Returns 0.5 (neutral) if no outlink data is available.
+        This is the expensive part (scans all edges once). The cheap part —
+        applying config weights — happens in _outlink_score().
         """
-        # Aggregate all outlinks from all pages on this domain
-        external_targets = []
+        # One pass: build per-domain external target lists
+        domain_targets = {}  # domain -> list of target domains
         for url, targets in self.edges.items():
-            if urlparse(url).netloc.lower() == domain:
-                for target in targets:
-                    td = urlparse(target).netloc.lower()
-                    if td != domain:  # external only
-                        external_targets.append(td)
+            src_domain = urlparse(url).netloc.lower()
+            if src_domain not in domain_targets:
+                domain_targets[src_domain] = []
+            for target in targets:
+                td = urlparse(target).netloc.lower()
+                if td != src_domain:
+                    domain_targets[src_domain].append(td)
 
-        if not external_targets:
-            return 0.5  # no data = neutral
+        # Compute fractions per domain
+        profiles = {}
+        for domain, ext_targets in domain_targets.items():
+            if not ext_targets:
+                profiles[domain] = {"ecosystem_fraction": 0.5, "non_platform_fraction": 0.5, "has_data": False}
+                continue
 
-        total = len(external_targets)
+            total = len(ext_targets)
 
-        # Signal 1: ecosystem integration - links to domains in our graph
-        if graph_domains:
-            in_graph = sum(1 for td in external_targets if td in graph_domains)
-            ecosystem_fraction = in_graph / total
-        else:
-            ecosystem_fraction = 0.5
+            if graph_domains:
+                in_graph = sum(1 for td in ext_targets if td in graph_domains)
+                eco_frac = in_graph / total
+            else:
+                eco_frac = 0.5
 
-        # Signal 2: platform avoidance - links NOT to known platforms
-        platform_count = sum(1 for td in external_targets if is_platform_domain(td))
-        non_platform_fraction = 1.0 - (platform_count / total)
+            plat_count = sum(1 for td in ext_targets if is_platform_domain(td))
+            non_plat_frac = 1.0 - (plat_count / total)
 
-        # Combined: ecosystem is the stronger signal (0.7), platform avoidance weaker (0.3)
-        score = 0.7 * ecosystem_fraction + 0.3 * non_platform_fraction
+            profiles[domain] = {
+                "ecosystem_fraction": round(eco_frac, 4),
+                "non_platform_fraction": round(non_plat_frac, 4),
+                "has_data": True,
+            }
 
+        return profiles
+
+    def _outlink_score(self, domain: str, cfg: dict = None) -> float:
+        """
+        Get outlink profile score for a domain using cached raw data + config weights.
+        Cheap: just a weighted sum of two pre-computed fractions.
+        """
+        if not hasattr(self, '_outlink_cache'):
+            return 0.5  # cache not built yet
+        profile = self._outlink_cache.get(domain, {"ecosystem_fraction": 0.5, "non_platform_fraction": 0.5, "has_data": False})
+        if not profile["has_data"]:
+            return 0.5
+
+        sw_cfg = (cfg or {}).get("smallweb", {})
+        eco_w = sw_cfg.get("ecosystem_weight", 0.7)
+        plat_w = sw_cfg.get("platform_weight", 0.3)
+        score = eco_w * profile["ecosystem_fraction"] + plat_w * profile["non_platform_fraction"]
         return round(score, 3)
 
-    def _smallweb_scores(self) -> Dict[str, dict]:
+    def _smallweb_scores(self, cfg: dict = None) -> Dict[str, dict]:
         """
         Compute per-domain "smallweb-ness" scores using data-driven signals.
 
@@ -316,8 +390,14 @@ class WebGraph:
             outlink_score: float,    # how much it links into our ecosystem
             smallweb_score: float,   # combined score 0.0-1.0
         }
+
+        Caches the inbound index and outlink profiles (expensive to compute).
+        Config-dependent values (popularity curve, weights) are applied fresh.
         """
-        inbound = self._build_inbound_index()
+        # Cache the expensive parts: inbound index and raw outlink profiles
+        if not hasattr(self, '_inbound_cache'):
+            self._inbound_cache = self._build_inbound_index()
+        inbound = self._inbound_cache
 
         # Build set of all domains in graph for ecosystem scoring
         scores = {}
@@ -328,37 +408,31 @@ class WebGraph:
         if not all_domains:
             return {}
 
+        # Cache outlink profiles (one-time full scan of edges)
+        if not hasattr(self, '_outlink_cache'):
+            self._outlink_cache = self._build_outlink_profiles(graph_domains=all_domains)
+
         for domain in all_domains:
             n_inbound = len(inbound.get(domain, set()))
-            outlink = self._outlink_profile(domain, graph_domains=all_domains)
+            outlink = self._outlink_score(domain, cfg=cfg)
 
-            # Popularity curve: log-normal-ish bell curve
-            # Peaks at ~4 inbound domains, drops off on both sides
-            if n_inbound == 0:
-                pop_score = 0.4  # orphan pages are suspect
-            elif n_inbound <= 2:
-                pop_score = 0.7  # few links, possibly real
-            elif n_inbound <= 8:
-                pop_score = 1.0  # sweet spot
-            elif n_inbound <= 15:
-                pop_score = 0.6  # getting popular
-            elif n_inbound <= 30:
-                pop_score = 0.3  # quite popular, probably not small web
-            elif n_inbound <= 60:
-                pop_score = 0.15  # very popular
-            else:
-                pop_score = 0.05  # platform-level
+            # Popularity curve from config (bell curve peaking at moderate popularity)
+            from scoring_config import popularity_score as _pop_score
+            pop_score = _pop_score(cfg or {}, n_inbound)
 
             # Combined: popularity × outlink profile
             # Both signals matter: a site should be moderately popular
             # AND link to other small sites in our ecosystem
-            combined = pop_score * (0.5 + 0.5 * outlink)  # outlink moderates, doesn't dominate
+            sw_cfg = (cfg or {}).get("smallweb", {})
+            mod = sw_cfg.get("outlink_moderation", 0.5)
+            combined = pop_score * (mod + mod * outlink)  # outlink moderates, doesn't dominate
 
             # Safety net: if domain is a known platform, cap the score
             # This isn't the primary filter (data-driven signals are), but prevents
             # edge cases where a platform has just 3 inbound links in a small graph
+            platform_cap = sw_cfg.get("platform_cap", 0.15)
             if is_platform_domain(domain):
-                combined = min(combined, 0.15)
+                combined = min(combined, platform_cap)
 
             scores[domain] = {
                 "inbound_domains": n_inbound,
@@ -386,7 +460,9 @@ class WebGraph:
         # Accept either URL or bare domain
         target_domain = urlparse(target).netloc.lower() if "://" in target else target.lower()
 
-        inbound = self._build_inbound_index()
+        if not hasattr(self, '_inbound_cache'):
+            self._inbound_cache = self._build_inbound_index()
+        inbound = self._inbound_cache
         target_sources = inbound.get(target_domain, set())
         if not target_sources:
             return []
@@ -667,34 +743,53 @@ def extract_links_and_meta(html: str, base_url: str) -> Tuple[str, str, List[str
     return title, description, links, anchor_texts
 
 
-def quality_score(html: str, soup: BeautifulSoup) -> float:
+def quality_score(html: str, soup: BeautifulSoup, cfg: dict = None) -> float:
     """
     Compute a quality score for a page (0.0 to 1.0).
 
     Ported from Marginalia's DocumentValuator + FeatureExtractor approach.
     Uses an additive penalty/bonus system on a log text-to-html ratio base.
 
-    Penalties: tracking scripts, ad-tech, affiliate links, cookie consent,
-              excessive scripts, low text ratio, link farms, AI content signals.
-    Bonuses:  IndieWeb signals (webmention, indieauth, RSS), clean HTML.
-
     Returns a float between 0.0 (spam) and 1.0 (clean content).
+    Also stores a detailed breakdown on the function attribute `last_breakdown`.
     """
+    breakdown = quality_breakdown(html, soup, cfg=cfg)
+    quality_score.last_breakdown = breakdown
+    return breakdown["score"]
+
+
+def quality_breakdown(html: str, soup: BeautifulSoup, cfg: dict = None) -> dict:
+    """
+    Compute quality score with full breakdown of every signal that fired.
+
+    Returns a dict with:
+      - score: final 0-1 score
+      - base: text ratio base score
+      - penalties: list of {signal, value, detail, why}
+      - bonuses: list of {signal, value, detail, why}
+      - text_ratio: raw text/html ratio
+
+    cfg: scoring config dict (from scoring_config.py). Uses defaults if None.
+    """
+    import math
+    if cfg is None:
+        from scoring_config import DEFAULTS
+        cfg = DEFAULTS
+    qp = cfg.get("quality_penalties", {})
+    qb = cfg.get("quality_bonuses", {})
+
     text = soup.get_text()
     text_len = len(text)
     html_len = max(len(html), 1)
     html_lower = html.lower()
 
     # ── Base score: text-to-html ratio (Marginalia's core signal) ──
-    # log(text/html) normalized to 0-1 range. Clean pages have ratio ~0.3-0.6,
-    # framework-heavy pages ~0.01-0.05
-    import math
     text_ratio = text_len / html_len
-    base = (math.log(text_ratio + 0.001) + 5) / 7  # maps ~0.001->0.1, ~0.5->0.95
+    base = (math.log(text_ratio + 0.001) + 5) / 7
     base = max(0.1, min(1.0, base))
 
-    # ── Penalty system (additive, then applied as multiplier) ──
-    penalty = 0.0
+    penalties = []
+    bonuses = []
 
     # --- Script analysis ---
     scripts = soup.find_all("script")
@@ -702,7 +797,6 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
     external_scripts = 0
     dynamic_injection = 0
 
-    # Tracker/ad-tech domains (from Marginalia's FeatureExtractor)
     TRACKER_DOMAINS = {
         "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
         "googleadservices.com", "google.com/adsense",
@@ -712,14 +806,20 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
         "optimizely.com", "crazyegg.com", "hubspot.com", "pardot.com",
         "marketo.net", "newrelic.com", "nr-data.net",
         "quantserve.com", "scorecardresearch.com", "chartbeat.com",
-        "omtrdc.net", "demdex.net",  # Adobe analytics
+        "omtrdc.net", "demdex.net",
         "adsrvr.org", "criteo.com", "taboola.com", "outbrain.com",
         "sharethrough.com", "pubmatic.com", "rubiconproject.com",
         "openx.net", "bidswitch.net",
     }
 
+    ADTECH_KEYWORDS = {"adsystem", "adsrvr", "adnxs", "doubleclick",
+                       "syndication", "criteo", "taboola", "outbrain",
+                       "pubmatic", "rubicon", "openx", "bidswitch"}
+
     tracker_count = 0
     adtech_count = 0
+    trackers_found = []
+    adtech_found = []
 
     for s in scripts:
         src = s.get("src", "")
@@ -728,26 +828,54 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
             src_lower = src.lower()
             for tracker in TRACKER_DOMAINS:
                 if tracker in src_lower:
-                    if any(ad in tracker for ad in ["adsystem", "adsrvr", "adnxs",
-                            "doubleclick", "syndication", "criteo", "taboola",
-                            "outbrain", "pubmatic", "rubicon", "openx", "bidswitch"]):
+                    if any(ad in tracker for ad in ADTECH_KEYWORDS):
                         adtech_count += 1
+                        adtech_found.append(tracker)
                     else:
                         tracker_count += 1
+                        trackers_found.append(tracker)
                     break
         else:
             inline_scripts += 1
-            # Check for dynamic script injection (Marginalia's createElement signal)
             script_text = s.string or ""
             if "createElement(" in script_text or "createElement (" in script_text:
                 dynamic_injection += 1
 
-    # Script penalties (inspired by Marginalia's ScriptVisitor)
-    penalty += external_scripts * 0.08     # -0.08 per external script
-    penalty += inline_scripts * 0.02       # -0.02 per inline script
-    penalty += dynamic_injection * 0.1     # -0.1 per createElement
-    penalty += tracker_count * 0.15        # -0.15 per tracker (Marginalia: -2.5 on their scale)
-    penalty += adtech_count * 0.2          # -0.2 per ad-tech script (Marginalia: -2.5)
+    if external_scripts:
+        penalties.append({
+            "signal": "external_scripts",
+            "value": round(external_scripts * qp.get("external_scripts", 0.08), 3),
+            "detail": f"{external_scripts} external scripts",
+            "why": "Each external script adds page weight, slows loading, and often loads third-party code. Clean personal sites rarely need more than 1-2."
+        })
+    if inline_scripts:
+        penalties.append({
+            "signal": "inline_scripts",
+            "value": round(inline_scripts * qp.get("inline_scripts", 0.02), 3),
+            "detail": f"{inline_scripts} inline scripts",
+            "why": "Small penalty per inline script. Some are fine (progressive enhancement), but dozens suggest framework overhead."
+        })
+    if dynamic_injection:
+        penalties.append({
+            "signal": "dynamic_injection",
+            "value": round(dynamic_injection * qp.get("dynamic_injection", 0.1), 3),
+            "detail": f"{dynamic_injection} createElement() calls",
+            "why": "Dynamically injecting scripts usually means loading trackers or ads that try to evade content blockers."
+        })
+    if tracker_count:
+        penalties.append({
+            "signal": "trackers",
+            "value": round(tracker_count * qp.get("trackers", 0.15), 3),
+            "detail": f"{tracker_count} trackers ({', '.join(trackers_found[:3])})",
+            "why": "Analytics and tracking scripts (Google Analytics, Hotjar, etc.) indicate a site that monitors visitors. Independent sites tend to skip these."
+        })
+    if adtech_count:
+        penalties.append({
+            "signal": "adtech",
+            "value": round(adtech_count * qp.get("adtech", 0.2), 3),
+            "detail": f"{adtech_count} ad-tech ({', '.join(adtech_found[:3])})",
+            "why": "Ad networks (DoubleClick, Criteo, Taboola) are the strongest commercial signal. Sites running programmatic ads are almost never small/indie web."
+        })
 
     # --- Cookie consent / GDPR banners ---
     CONSENT_SIGNALS = [
@@ -755,20 +883,35 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
         "gdpr", "cookie-banner", "cookiebanner", "didomi",
         "quantcast.mgr", "sp_data", "consent-manager",
     ]
-    consent_found = sum(1 for sig in CONSENT_SIGNALS if sig in html_lower)
-    penalty += min(consent_found * 0.1, 0.3)  # cap at -0.3
+    consent_found = [sig for sig in CONSENT_SIGNALS if sig in html_lower]
+    consent_penalty = min(len(consent_found) * qp.get("cookie_consent", 0.1), qp.get("cookie_consent_max", 0.3))
+    if consent_found:
+        penalties.append({
+            "signal": "cookie_consent",
+            "value": round(consent_penalty, 3),
+            "detail": f"consent banners ({', '.join(consent_found[:3])})",
+            "why": "Cookie consent managers indicate commercial data collection. If a site needs a GDPR banner, it's tracking you enough to require legal notice."
+        })
 
     # --- Affiliate links ---
     affiliate_patterns = ["amzn.to/", "tag=", "affiliate", "ref=", "partner="]
     all_links = soup.find_all("a", href=True)
     affiliate_count = sum(1 for a in all_links
                          if any(p in (a.get("href", "").lower()) for p in affiliate_patterns))
-    penalty += min(affiliate_count * 0.05, 0.25)
+    affiliate_penalty = min(affiliate_count * qp.get("affiliate_links", 0.05), qp.get("affiliate_links_max", 0.25))
+    if affiliate_count:
+        penalties.append({
+            "signal": "affiliate_links",
+            "value": round(affiliate_penalty, 3),
+            "detail": f"{affiliate_count} affiliate links",
+            "why": "Affiliate links (Amazon, partner programs) suggest the content may be commercially motivated rather than purely informational."
+        })
 
-    # --- AI content farm signals (from Marginalia's ChatGPT detection) ---
+    # --- AI content farm signals ---
     headings = soup.find_all(["h1", "h2", "h3", "h4"])
     heading_texts = [h.get_text().lower().strip() for h in headings]
     ai_signals = 0
+    ai_matches = []
     AI_HEADING_PATTERNS = [
         "benefits of", "key benefits", "key takeaways", "in conclusion",
         "frequently asked questions", "what you need to know",
@@ -779,42 +922,96 @@ def quality_score(html: str, soup: BeautifulSoup) -> float:
         for pattern in AI_HEADING_PATTERNS:
             if pattern in ht:
                 ai_signals += 1
+                ai_matches.append(pattern)
                 break
-    if ai_signals >= 3:
-        penalty += 0.5   # almost certainly AI content farm
+    ai_threshold = int(qp.get("ai_content_threshold", 3))
+    if ai_signals >= ai_threshold:
+        penalties.append({
+            "signal": "ai_content",
+            "value": qp.get("ai_content_high", 0.5),
+            "detail": f"{ai_signals} AI-pattern headings ({', '.join(ai_matches[:3])})",
+            "why": "Multiple generic headings like 'Key Takeaways' and 'Ultimate Guide' are strong signals of AI-generated content farm pages."
+        })
     elif ai_signals >= 1:
-        penalty += 0.15
+        penalties.append({
+            "signal": "ai_content",
+            "value": qp.get("ai_content_low", 0.15),
+            "detail": f"{ai_signals} AI-pattern heading ({', '.join(ai_matches[:2])})",
+            "why": "Generic headings sometimes appear in real content, but they correlate with AI-generated or SEO-optimized pages."
+        })
 
-    # --- Link density (link farm detection) ---
+    # --- Link density ---
     text_words = max(len(text.split()), 1)
     link_density = len(all_links) / text_words
-    if link_density > 0.5:
-        penalty += 0.4
-    elif link_density > 0.3:
-        penalty += 0.2
+    if link_density > qp.get("link_farm_threshold", 0.5):
+        penalties.append({
+            "signal": "link_farm",
+            "value": qp.get("link_farm", 0.4),
+            "detail": f"link density {link_density:.2f} (>{qp.get('link_farm_threshold', 0.5)})",
+            "why": "When more than half the words are links, the page is likely a directory, blogroll, or link farm rather than original content."
+        })
+    elif link_density > qp.get("link_density_threshold", 0.3):
+        penalties.append({
+            "signal": "link_density",
+            "value": qp.get("link_density", 0.2),
+            "detail": f"link density {link_density:.2f} (>0.3)",
+            "why": "High link-to-text ratio suggests a page focused on navigation rather than content. Some link density is fine, but this is above average."
+        })
 
-    # --- Acceptable Ads / ad-block detection (Marginalia: instant reject) ---
+    # --- Ad-block key ---
     if "data-adblockkey" in html_lower or "x-adblock-key" in html_lower:
-        penalty += 0.6  # "only domain squatters" use this per Marginalia
+        penalties.append({
+            "signal": "adblock_key",
+            "value": qp.get("adblock_key", 0.6),
+            "detail": "adblock circumvention key detected",
+            "why": "The Acceptable Ads / adblock-key meta tag is used almost exclusively by domain squatters and aggressive ad sites. Per Marginalia: 'only domain squatters use this.'"
+        })
 
-    # ── Bonus system (positive signals) ──
-    bonus = 0.0
-
-    # IndieWeb signals (from Marginalia's FeatureExtractor)
+    # ── Bonuses ──
     if 'rel="webmention"' in html_lower or "webmention" in html_lower:
-        bonus += 0.1
+        bonuses.append({
+            "signal": "webmention",
+            "value": qb.get("webmention", 0.1),
+            "detail": "supports Webmention",
+            "why": "Webmention is an IndieWeb standard for cross-site conversations. Indicates the author participates in the decentralized web community."
+        })
     if 'rel="indieauth"' in html_lower or "indieauth" in html_lower:
-        bonus += 0.1
-    # RSS/Atom feed link
+        bonuses.append({
+            "signal": "indieauth",
+            "value": qb.get("indieauth", 0.1),
+            "detail": "supports IndieAuth",
+            "why": "IndieAuth lets you sign in with your own domain. Strong signal of someone who owns their identity on the web."
+        })
     if 'type="application/rss+xml"' in html_lower or 'type="application/atom+xml"' in html_lower:
-        bonus += 0.05
-    # Microformats (h-card, h-entry — IndieWeb building blocks)
+        bonuses.append({
+            "signal": "rss_feed",
+            "value": qb.get("rss_feed", 0.05),
+            "detail": "has RSS/Atom feed",
+            "why": "Offering an RSS feed means the author cares about open, follow-able content outside of walled-garden platforms."
+        })
     if "h-card" in html_lower or "h-entry" in html_lower:
-        bonus += 0.05
+        bonuses.append({
+            "signal": "microformats",
+            "value": qb.get("microformats", 0.05),
+            "detail": "uses microformats (h-card/h-entry)",
+            "why": "Microformats are machine-readable markup used by IndieWeb tools. Indicates a technically engaged author building for the open web."
+        })
 
     # ── Final score ──
-    score = base - penalty + bonus
-    return round(max(0.0, min(1.0, score)), 3)
+    total_penalty = sum(p["value"] for p in penalties)
+    total_bonus = sum(b["value"] for b in bonuses)
+    score = base - total_penalty + total_bonus
+    score = round(max(0.0, min(1.0, score)), 3)
+
+    return {
+        "score": score,
+        "base": round(base, 3),
+        "text_ratio": round(text_ratio, 4),
+        "total_penalty": round(total_penalty, 3),
+        "total_bonus": round(total_bonus, 3),
+        "penalties": penalties,
+        "bonuses": bonuses,
+    }
 
 
 # ── Platform / Big-site detection ─────────────────────────────────────
@@ -1075,12 +1272,15 @@ async def crawl(seeds: List[str], max_hops: int = 2, max_pages: int = 200,
 
                 title, description, links, anchors = extract_links_and_meta(html, final_url)
 
-                # Compute quality score
+                # Compute quality score with full breakdown
                 soup = BeautifulSoup(html, "html.parser")
                 q_score = quality_score(html, soup)
+                q_breakdown = quality_score.last_breakdown
 
                 graph.add_node(final_url, title=title, description=description, depth=depth)
-                graph.nodes[graph._normalize_url(final_url)]["quality"] = q_score
+                norm_url = graph._normalize_url(final_url)
+                graph.nodes[norm_url]["quality"] = q_score
+                graph.nodes[norm_url]["quality_breakdown"] = q_breakdown
 
                 # Add edges, queue new URLs, and store anchor texts
                 for link in links:
@@ -1203,6 +1403,40 @@ SERVE_HTML = """<!DOCTYPE html>
 
   /* Score badge */
   .score-badge { font-size: 0.65rem; color: #333; font-weight: 600; white-space: nowrap; }
+  .why-toggle { cursor: pointer; color: #4a6a8a; text-decoration: none; }
+  .why-toggle:hover { color: #4fc3f7; }
+
+  /* Breakdown panel */
+  .breakdown { background: #080808; border-top: 1px solid #1a1a1a; padding: 0.8rem; margin-top: 0.5rem; font-size: 0.72rem; line-height: 1.5; }
+  .breakdown-section { margin-bottom: 0.8rem; }
+  .breakdown-section:last-child { margin-bottom: 0; }
+  .breakdown-title { color: #4fc3f7; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; font-weight: 600; }
+  .breakdown-subtitle { color: #888; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em; margin: 0.5rem 0 0.3rem; }
+  .breakdown-formula { font-family: 'Berkeley Mono', monospace; color: #b0b0b0; background: #0d0d0d; padding: 0.3rem 0.5rem; border-radius: 4px; margin-bottom: 0.5rem; font-size: 0.68rem; }
+  .breakdown-components { display: flex; flex-direction: column; gap: 0.3rem; }
+  .breakdown-row { display: grid; grid-template-columns: 100px 50px 1fr; gap: 0.4rem; align-items: start; padding: 0.2rem 0; border-bottom: 1px solid #111; }
+  .breakdown-row.penalty .breakdown-val { color: #ef5350; }
+  .breakdown-row.bonus .breakdown-val { color: #81c784; }
+  .breakdown-key { color: #888; font-family: 'Berkeley Mono', monospace; font-size: 0.65rem; }
+  .breakdown-val { color: #ddd; font-family: 'Berkeley Mono', monospace; font-size: 0.65rem; font-weight: 600; text-align: right; }
+  .breakdown-detail { color: #999; font-size: 0.65rem; }
+  .breakdown-why { color: #555; font-size: 0.62rem; font-style: italic; grid-column: 1 / -1; padding-left: 0.5rem; }
+  .breakdown-note { color: #666; font-style: italic; }
+
+  /* Algorithm explainer */
+  .algo-explainer { margin-bottom: 1.2rem; }
+  .algo-explainer summary { cursor: pointer; color: #4fc3f7; font-size: 0.8rem; padding: 0.5rem 0; user-select: none; }
+  .algo-explainer summary:hover { color: #81d4fa; }
+  .algo-content { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 8px; padding: 1rem; margin-top: 0.4rem; }
+  .algo-content p { font-size: 0.75rem; color: #999; line-height: 1.5; margin-bottom: 0.6rem; }
+  .algo-content a { color: #4fc3f7; }
+  .algo-formula { font-family: 'Berkeley Mono', monospace; background: #111; padding: 0.5rem 0.8rem; border-radius: 6px; color: #e0e0e0; font-size: 0.78rem; margin-bottom: 0.8rem; text-align: center; }
+  .algo-signals { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.6rem; }
+  .algo-signal { background: #0d0d0d; border: 1px solid #151515; border-radius: 6px; padding: 0.6rem 0.8rem; }
+  .algo-signal-name { color: #ddd; font-size: 0.78rem; font-weight: 600; margin-bottom: 0.2rem; }
+  .algo-tag { font-size: 0.6rem; color: #4a6a8a; background: #0a1525; padding: 0.1rem 0.4rem; border-radius: 3px; margin-left: 0.4rem; font-weight: 400; }
+  .algo-signal-desc { color: #777; font-size: 0.7rem; line-height: 1.5; }
+  .algo-note { color: #555; font-size: 0.7rem; font-style: italic; margin-bottom: 0; }
 
   /* Smallweb score indicator */
   .sw-indicator { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.25rem; }
@@ -1287,6 +1521,31 @@ SERVE_HTML = """<!DOCTYPE html>
 
   /* Footer */
   footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #1a1a1a; color: #333; font-size: 0.7rem; }
+
+  /* Tune panel */
+  .tune-panel { background: #0a0a0a; border: 1px solid #1a1a1a; border-radius: 8px; margin-bottom: 1rem; }
+  .tune-panel summary { padding: 0.6rem 1rem; cursor: pointer; color: #888; font-size: 0.78rem; }
+  .tune-panel summary:hover { color: #4fc3f7; }
+  .tune-panel[open] summary { border-bottom: 1px solid #1a1a1a; color: #4fc3f7; }
+  .tune-content { padding: 1rem; }
+  .tune-presets { display: flex; gap: 0.4rem; margin-bottom: 1rem; flex-wrap: wrap; }
+  .preset-btn { background: #151515; border: 1px solid #222; color: #888; padding: 0.3rem 0.7rem; border-radius: 4px; font-size: 0.72rem; cursor: pointer; transition: all 0.15s; }
+  .preset-btn:hover { border-color: #4fc3f7; color: #4fc3f7; }
+  .preset-btn.active { border-color: #4fc3f7; color: #4fc3f7; background: #0a1520; }
+  .tune-section { margin-bottom: 0.8rem; }
+  .tune-section-title { color: #555; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; }
+  .slider-row { display: grid; grid-template-columns: 90px 1fr 45px; gap: 0.5rem; align-items: center; padding: 0.2rem 0; }
+  .slider-label { color: #999; font-size: 0.72rem; font-family: 'Berkeley Mono', monospace; }
+  .slider-value { color: #ddd; font-size: 0.72rem; font-family: 'Berkeley Mono', monospace; text-align: right; font-weight: 600; }
+  input[type="range"] { -webkit-appearance: none; width: 100%; height: 4px; background: #222; border-radius: 2px; outline: none; }
+  input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; background: #4fc3f7; border-radius: 50%; cursor: pointer; }
+  input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; background: #4fc3f7; border-radius: 50%; cursor: pointer; border: none; }
+  .tune-actions { display: flex; gap: 0.5rem; margin-top: 0.8rem; align-items: center; }
+  .tune-btn { background: #151515; border: 1px solid #222; color: #888; padding: 0.35rem 0.8rem; border-radius: 4px; font-size: 0.72rem; cursor: pointer; }
+  .tune-btn:hover { border-color: #4fc3f7; color: #4fc3f7; }
+  .tune-btn.primary { border-color: #4fc3f7; color: #4fc3f7; }
+  .tune-msg { font-size: 0.7rem; color: #555; }
+  .tune-formula { font-family: 'Berkeley Mono', monospace; color: #888; font-size: 0.7rem; background: #0d0d0d; padding: 0.4rem 0.6rem; border-radius: 4px; margin-bottom: 0.8rem; }
 </style>
 </head>
 <body>
@@ -1309,6 +1568,32 @@ SERVE_HTML = """<!DOCTYPE html>
 
   <!-- Tab: Discoveries -->
   <div class="tab-panel active" id="tab-discoveries">
+    <details class="algo-explainer">
+      <summary>how scoring works</summary>
+      <div class="algo-content">
+        <p>Every discovered page gets a single <strong>overall score</strong> that blends four signals:</p>
+        <div class="algo-formula">score = pagerank_pct &times; quality &times; smallweb &times; (0.5 + 0.5 &times; taste)</div>
+        <div class="algo-signals">
+          <div class="algo-signal">
+            <div class="algo-signal-name">pagerank <span class="algo-tag">link authority</span></div>
+            <div class="algo-signal-desc">How well-connected this page is in the link graph. Computed as personalized PageRank (biased toward your seed sites), then converted to a percentile (0&ndash;1) so it doesn't drown out other signals. A page that many other pages link to ranks higher.</div>
+          </div>
+          <div class="algo-signal">
+            <div class="algo-signal-name">quality <span class="algo-tag">html cleanliness</span></div>
+            <div class="algo-signal-desc">Measures how clean the page's HTML is. Starts from the text-to-HTML ratio (more text, less markup = better), then applies penalties for trackers, ad-tech scripts, cookie banners, affiliate links, and AI-generated content patterns. Bonuses for IndieWeb signals like Webmention, IndieAuth, RSS feeds, and microformats. Inspired by <a href="https://search.marginalia.nu" target="_blank">Marginalia Search</a>.</div>
+          </div>
+          <div class="algo-signal">
+            <div class="algo-signal-name">smallweb <span class="algo-tag">indie score</span></div>
+            <div class="algo-signal-desc">Is this domain part of the small web? Combines two sub-signals: <strong>popularity</strong> (a bell curve &mdash; too many inbound links means it's a platform, not a personal site) and <strong>outlink profile</strong> (what fraction of its outlinks go to other small sites vs. big platforms).</div>
+          </div>
+          <div class="algo-signal">
+            <div class="algo-signal-name">taste <span class="algo-tag">neural preference</span></div>
+            <div class="algo-signal-desc">Optional. If you upvote/downvote discoveries, a small neural classifier learns your preferences. Uses sentence embeddings (MiniLM) on page URLs to predict whether you'd like new pages. Neutral (0.5) when untrained.</div>
+          </div>
+        </div>
+        <p class="algo-note">Click the score badge (&oplus;) on any result to see exactly how it was scored, including which penalties and bonuses fired.</p>
+      </div>
+    </details>
     <div class="controls">
       <div>
         <div class="control-label">ranking</div>
@@ -1321,13 +1606,62 @@ SERVE_HTML = """<!DOCTYPE html>
         <div class="control-label">sort by</div>
         <div class="toggle-group">
           <button class="toggle-btn active" data-sort="blended" onclick="switchSort('blended')">overall</button>
-          <button class="toggle-btn" data-sort="score" onclick="switchSort('score')">pagerank</button>
+          <button class="toggle-btn" data-sort="pagerank" onclick="switchSort('pagerank')">pagerank</button>
           <button class="toggle-btn" data-sort="quality" onclick="switchSort('quality')">quality</button>
           <button class="toggle-btn" data-sort="smallweb" onclick="switchSort('smallweb')">smallweb</button>
           <button class="toggle-btn" data-sort="taste" onclick="switchSort('taste')">taste</button>
         </div>
       </div>
     </div>
+
+    <details class="tune-panel" id="tunePanel">
+      <summary>tune algorithm</summary>
+      <div class="tune-content">
+        <div class="tune-presets">
+          <button class="preset-btn active" onclick="applyPreset('default')">default</button>
+          <button class="preset-btn" onclick="applyPreset('indie_purist')">indie purist</button>
+          <button class="preset-btn" onclick="applyPreset('quality_focused')">quality focused</button>
+          <button class="preset-btn" onclick="applyPreset('broad_discovery')">broad discovery</button>
+        </div>
+        <div class="tune-formula" id="tuneFormula">score = pagerank &times; quality &times; smallweb</div>
+        <div class="tune-section">
+          <div class="tune-section-title">signal weights (exponent &mdash; higher = more discriminating)</div>
+          <div class="slider-row">
+            <span class="slider-label">pagerank</span>
+            <input type="range" id="sl-pagerank" min="0" max="2" step="0.1" value="1.0" oninput="onSlider(this)">
+            <span class="slider-value" id="sv-pagerank">1.0</span>
+          </div>
+          <div class="slider-row">
+            <span class="slider-label">quality</span>
+            <input type="range" id="sl-quality" min="0" max="2" step="0.1" value="1.0" oninput="onSlider(this)">
+            <span class="slider-value" id="sv-quality">1.0</span>
+          </div>
+          <div class="slider-row">
+            <span class="slider-label">smallweb</span>
+            <input type="range" id="sl-smallweb" min="0" max="2" step="0.1" value="1.0" oninput="onSlider(this)">
+            <span class="slider-value" id="sv-smallweb">1.0</span>
+          </div>
+          <div class="slider-row" id="sl-taste-row" style="display:none">
+            <span class="slider-label">taste</span>
+            <input type="range" id="sl-taste-weight" min="0" max="1" step="0.1" value="0.5" oninput="onSlider(this)">
+            <span class="slider-value" id="sv-taste-weight">0.5</span>
+          </div>
+        </div>
+        <div class="tune-section">
+          <div class="tune-section-title">unfetched page penalty</div>
+          <div class="slider-row">
+            <span class="slider-label">fetched boost</span>
+            <input type="range" id="sl-fetched" min="0" max="1" step="0.05" value="0.2" oninput="onSlider(this)">
+            <span class="slider-value" id="sv-fetched">0.2</span>
+          </div>
+        </div>
+        <div class="tune-actions">
+          <button class="tune-btn primary" onclick="saveConfig()">save to graph</button>
+          <button class="tune-btn" onclick="resetConfig()">reset to defaults</button>
+          <span class="tune-msg" id="tuneMsg"></span>
+        </div>
+      </div>
+    </details>
 
     <div id="tastePanel" class="taste-panel" style="display:none">
       <h3>taste classifier</h3>
@@ -1380,7 +1714,7 @@ SERVE_HTML = """<!DOCTYPE html>
 
 <script>
 const GRAPH_ID = '$graph_id';
-const API = '/smallweb/api';
+const API = (location.pathname.startsWith('/smallweb') ? '/smallweb' : '') + '/api';
 
 let currentSort = 'blended';
 let currentRank = 'personalized';
@@ -1416,10 +1750,32 @@ async function loadDiscoveries(rank) {
 
   try {
     const personalized = key === 'personalized' ? 'true' : 'false';
-    const url = API + '/graphs/' + GRAPH_ID + '/discoveries?top=50&personalized=' + personalized;
+    let url = API + '/graphs/' + GRAPH_ID + '/discoveries?top=50&personalized=' + personalized;
+
+    // If tuning panel is open and sliders have been changed, send config overrides
+    const tunePanel = document.getElementById('tunePanel');
+    if (tunePanel && tunePanel.open) {
+      const overrides = collectSliderValues();
+      url += '&config=' + encodeURIComponent(JSON.stringify(overrides));
+    }
+
     const res = await fetch(url);
     const data = await res.json();
     discoveriesCache[key] = data.discoveries || [];
+
+    // Update config state from response
+    if (data.config) {
+      currentConfig = data.config;
+      // Show taste slider if taste is active
+      if (data.taste_active) {
+        document.getElementById('sl-taste-row').style.display = '';
+      }
+      // Set sliders to match returned config (on first load)
+      if (!tunePanel.open) {
+        setSliders(data.config);
+      }
+    }
+
     renderDiscoveries(discoveriesCache[key]);
   } catch (e) {
     container.innerHTML = '<div class="empty">error loading discoveries: ' + e.message + '</div>';
@@ -1431,16 +1787,17 @@ function renderDiscoveries(discoveries) {
 
   // Sort
   let sorted = [...discoveries];
-  if (currentSort === 'quality') {
+  if (currentSort === 'blended') {
+    sorted.sort((a, b) => (b.score || 0) - (a.score || 0));
+  } else if (currentSort === 'pagerank') {
+    sorted.sort((a, b) => (b.pagerank || 0) - (a.pagerank || 0));
+  } else if (currentSort === 'quality') {
     sorted.sort((a, b) => (b.quality || 0) - (a.quality || 0));
   } else if (currentSort === 'smallweb') {
     sorted.sort((a, b) => (b.smallweb_score || 0) - (a.smallweb_score || 0));
   } else if (currentSort === 'taste') {
     sorted.sort((a, b) => (b.taste_score || 0.5) - (a.taste_score || 0.5));
-  } else if (currentSort === 'blended') {
-    sorted.sort((a, b) => ((b.score || 0) * (b.quality || 1) * (b.smallweb_score || 0.5)) - ((a.score || 0) * (a.quality || 1) * (a.smallweb_score || 0.5)));
   }
-  // 'score' is already default order from API (pagerank * quality * smallweb)
 
   if (sorted.length === 0) {
     container.innerHTML = '<div class="empty">no discoveries yet &mdash; try crawling with more hops</div>';
@@ -1449,8 +1806,9 @@ function renderDiscoveries(discoveries) {
 
   container.innerHTML = sorted.map((d, i) => {
     const title = d.title || new URL(d.url).hostname;
-    const quality = d.quality != null ? d.quality : 1.0;
-    const qColor = quality >= 0.7 ? '#81c784' : quality >= 0.4 ? '#ffb74d' : '#ef5350';
+    const quality = d.quality != null ? d.quality : 0.5;
+    const qMeasured = d.quality_measured !== false;
+    const qColor = !qMeasured ? '#555' : quality >= 0.7 ? '#81c784' : quality >= 0.4 ? '#ffb74d' : '#ef5350';
     const qPct = Math.round(quality * 100);
     const domain = d.domain || new URL(d.url).hostname;
     const sw = d.smallweb_score != null ? d.smallweb_score : 0.5;
@@ -1464,6 +1822,46 @@ function renderDiscoveries(discoveries) {
     const anchorHtml = anchors.length > 0
       ? '<div class="anchor-texts">' + anchors.map(a => '<span class="anchor-pill" title="' + escHtml(a) + '">' + escHtml(a) + '</span>').join('') + '</div>'
       : '';
+
+    // Build breakdown HTML
+    const breakdownId = 'breakdown-' + i;
+    let breakdownHtml = '';
+
+    // Overall score formula
+    const sb = d.score_breakdown;
+    if (sb) {
+      breakdownHtml += '<div class="breakdown-section"><div class="breakdown-title">overall score</div>';
+      breakdownHtml += '<div class="breakdown-formula">' + escHtml(sb.formula) + '</div>';
+      breakdownHtml += '<div class="breakdown-components">';
+      for (const [key, comp] of Object.entries(sb.components || {})) {
+        const val = comp.value != null ? (typeof comp.value === 'number' ? comp.value.toFixed(3) : comp.value) : '?';
+        breakdownHtml += '<div class="breakdown-row"><span class="breakdown-key">' + escHtml(key) + '</span><span class="breakdown-val">' + val + '</span><span class="breakdown-why">' + escHtml(comp.why || '') + '</span></div>';
+      }
+      breakdownHtml += '</div></div>';
+    }
+
+    // Quality breakdown (if measured)
+    const qb = d.quality_breakdown;
+    if (qb) {
+      breakdownHtml += '<div class="breakdown-section"><div class="breakdown-title">quality breakdown</div>';
+      breakdownHtml += '<div class="breakdown-row"><span class="breakdown-key">text ratio</span><span class="breakdown-val">' + (qb.text_ratio * 100).toFixed(1) + '%</span><span class="breakdown-why">What fraction of the HTML is actual text vs markup. Higher = less bloat.</span></div>';
+      breakdownHtml += '<div class="breakdown-row"><span class="breakdown-key">base score</span><span class="breakdown-val">' + qb.base.toFixed(3) + '</span><span class="breakdown-why">Starting score from text-to-html ratio. log(ratio) normalized to 0\u20131.</span></div>';
+      if (qb.penalties && qb.penalties.length > 0) {
+        breakdownHtml += '<div class="breakdown-subtitle">penalties</div>';
+        for (const p of qb.penalties) {
+          breakdownHtml += '<div class="breakdown-row penalty"><span class="breakdown-key">' + escHtml(p.signal) + '</span><span class="breakdown-val">-' + p.value.toFixed(3) + '</span><span class="breakdown-detail">' + escHtml(p.detail) + '</span><span class="breakdown-why">' + escHtml(p.why) + '</span></div>';
+        }
+      }
+      if (qb.bonuses && qb.bonuses.length > 0) {
+        breakdownHtml += '<div class="breakdown-subtitle">bonuses</div>';
+        for (const b of qb.bonuses) {
+          breakdownHtml += '<div class="breakdown-row bonus"><span class="breakdown-key">' + escHtml(b.signal) + '</span><span class="breakdown-val">+' + b.value.toFixed(3) + '</span><span class="breakdown-detail">' + escHtml(b.detail) + '</span><span class="breakdown-why">' + escHtml(b.why) + '</span></div>';
+        }
+      }
+      breakdownHtml += '</div>';
+    } else if (!qMeasured) {
+      breakdownHtml += '<div class="breakdown-section"><div class="breakdown-title">quality</div><div class="breakdown-note">Not measured \u2014 this page was discovered as an outlink but not fetched. Quality defaults to 0.5 (neutral).</div></div>';
+    }
 
     return '<div class="discovery">' +
       '<div class="discovery-header">' +
@@ -1479,19 +1877,20 @@ function renderDiscoveries(discoveries) {
           '</div>' +
         '</div>' +
         '<div style="text-align:right">' +
-          '<div class="quality-bar-wrap" title="quality: ' + qPct + '%">' +
-            '<div class="quality-bar"><div class="quality-bar-fill" style="width:' + qPct + '%;background:' + qColor + '"></div></div>' +
-            '<span class="quality-label" style="color:' + qColor + '">' + qPct + '</span>' +
+          '<div class="quality-bar-wrap" title="quality: ' + (qMeasured ? qPct + '%' : 'not measured') + '">' +
+            '<div class="quality-bar"><div class="quality-bar-fill" style="width:' + qPct + '%;background:' + qColor + (qMeasured ? '' : ';opacity:0.3') + '"></div></div>' +
+            '<span class="quality-label" style="color:' + qColor + '">' + (qMeasured ? qPct : '?') + '</span>' +
           '</div>' +
           '<div class="sw-indicator" title="smallweb score: ' + sw.toFixed(2) + ' | inbound: ' + inbound + ' domains | outlinks: ' + outlink + '% small">' +
             '<span class="sw-dot" style="background:' + swColor + '"></span>' +
             '<span class="sw-label" style="color:' + swColor + '">sw ' + sw.toFixed(2) + '</span>' +
           '</div>' +
-          '<div class="sw-details">' + inbound + ' in · ' + outlink + '% small</div>' +
+          '<div class="sw-details">' + inbound + ' in \u00b7 ' + outlink + '% small</div>' +
           (taste !== 0.5 ? '<div class="taste-score">taste: ' + taste.toFixed(2) + '</div>' : '') +
-          '<div class="score-badge">#' + (i + 1) + ' &middot; ' + d.score.toFixed(4) + '</div>' +
+          '<div class="score-badge"><a class="why-toggle" onclick="toggleBreakdown(\\'' + breakdownId + '\\')" title="show score breakdown">#' + (i + 1) + ' \u00b7 ' + d.score.toFixed(4) + ' \u24d8</a></div>' +
         '</div>' +
       '</div>' +
+      '<div class="breakdown" id="' + breakdownId + '" style="display:none">' + breakdownHtml + '</div>' +
     '</div>';
   }).join('');
 }
@@ -1507,6 +1906,11 @@ function switchSort(sort) {
   document.querySelectorAll('[data-sort]').forEach(b => b.classList.toggle('active', b.dataset.sort === sort));
   const cached = discoveriesCache[currentRank];
   if (cached) renderDiscoveries(cached);
+}
+
+function toggleBreakdown(id) {
+  const el = document.getElementById(id);
+  if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
 }
 
 // ── Similarity ──
@@ -1690,6 +2094,130 @@ async function trainTaste() {
 
   btn.disabled = false;
   loadTasteStatus();
+}
+
+// ── Tuning System ──
+
+let currentConfig = null;  // populated from discoveries response
+let rescoreTimer = null;
+
+function onSlider(el) {
+  // Update the value display
+  const id = el.id.replace('sl-', 'sv-');
+  document.getElementById(id).textContent = parseFloat(el.value).toFixed(1);
+  updateFormulaDisplay();
+  scheduleRescore();
+  // Clear preset highlights
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+}
+
+function updateFormulaDisplay() {
+  const pr = parseFloat(document.getElementById('sl-pagerank').value);
+  const q = parseFloat(document.getElementById('sl-quality').value);
+  const sw = parseFloat(document.getElementById('sl-smallweb').value);
+  const tw = parseFloat(document.getElementById('sl-taste-weight').value);
+  const expStr = (name, exp) => exp === 1.0 ? name : name + '^' + exp.toFixed(1);
+  let parts = [expStr('pagerank', pr), expStr('quality', q), expStr('smallweb', sw)];
+  const tasteRow = document.getElementById('sl-taste-row');
+  if (tasteRow && tasteRow.style.display !== 'none') {
+    parts.push('(' + (1 - tw).toFixed(1) + ' + ' + tw.toFixed(1) + ' × taste)');
+  }
+  document.getElementById('tuneFormula').textContent = 'score = ' + parts.join(' × ');
+}
+
+function collectSliderValues() {
+  return {
+    formula: {
+      pagerank_exp: parseFloat(document.getElementById('sl-pagerank').value),
+      quality_exp: parseFloat(document.getElementById('sl-quality').value),
+      smallweb_exp: parseFloat(document.getElementById('sl-smallweb').value),
+      taste_weight: parseFloat(document.getElementById('sl-taste-weight').value),
+      taste_base: 1.0 - parseFloat(document.getElementById('sl-taste-weight').value),
+      fetched_boost: parseFloat(document.getElementById('sl-fetched').value),
+    }
+  };
+}
+
+function setSliders(cfg) {
+  const f = (cfg && cfg.formula) || {};
+  document.getElementById('sl-pagerank').value = f.pagerank_exp != null ? f.pagerank_exp : 1.0;
+  document.getElementById('sv-pagerank').textContent = parseFloat(document.getElementById('sl-pagerank').value).toFixed(1);
+  document.getElementById('sl-quality').value = f.quality_exp != null ? f.quality_exp : 1.0;
+  document.getElementById('sv-quality').textContent = parseFloat(document.getElementById('sl-quality').value).toFixed(1);
+  document.getElementById('sl-smallweb').value = f.smallweb_exp != null ? f.smallweb_exp : 1.0;
+  document.getElementById('sv-smallweb').textContent = parseFloat(document.getElementById('sl-smallweb').value).toFixed(1);
+  document.getElementById('sl-taste-weight').value = f.taste_weight != null ? f.taste_weight : 0.5;
+  document.getElementById('sv-taste-weight').textContent = parseFloat(document.getElementById('sl-taste-weight').value).toFixed(1);
+  document.getElementById('sl-fetched').value = f.fetched_boost != null ? f.fetched_boost : 0.2;
+  document.getElementById('sv-fetched').textContent = parseFloat(document.getElementById('sl-fetched').value).toFixed(2);
+  updateFormulaDisplay();
+}
+
+function scheduleRescore() {
+  clearTimeout(rescoreTimer);
+  rescoreTimer = setTimeout(() => {
+    // Show loading state
+    const container = document.getElementById('discoveriesContainer');
+    container.innerHTML = '<div class="loading"><span class="spinner"></span>re-scoring with new weights...</div>';
+    // Clear cache and reload with config overrides
+    discoveriesCache = { personalized: null, standard: null };
+    loadDiscoveries();
+  }, 300);
+}
+
+async function applyPreset(name) {
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  if (typeof event !== 'undefined' && event && event.target) event.target.classList.add('active');
+  if (name === 'default') {
+    setSliders({ formula: { pagerank_exp: 1.0, quality_exp: 1.0, smallweb_exp: 1.0, taste_weight: 0.5, fetched_boost: 0.2 } });
+  } else {
+    try {
+      const res = await fetch(API + '/graphs/' + GRAPH_ID + '/config/presets');
+      const data = await res.json();
+      const preset = data.presets[name];
+      if (preset) {
+        // Start from defaults, apply preset
+        const base = { pagerank_exp: 1.0, quality_exp: 1.0, smallweb_exp: 1.0, taste_weight: 0.5, fetched_boost: 0.2 };
+        const merged = Object.assign({}, base, preset.formula || {});
+        setSliders({ formula: merged });
+      }
+    } catch (e) {
+      console.error('preset error:', e);
+    }
+  }
+  scheduleRescore();
+}
+
+async function saveConfig() {
+  const overrides = collectSliderValues();
+  const msg = document.getElementById('tuneMsg');
+  try {
+    const res = await fetch(API + '/graphs/' + GRAPH_ID + '/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(overrides),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      msg.textContent = 'saved!';
+      msg.style.color = '#81c784';
+      currentConfig = data.config;
+    } else {
+      msg.textContent = data.error || 'save failed';
+      msg.style.color = '#ef5350';
+    }
+  } catch (e) {
+    msg.textContent = 'error: ' + e.message;
+    msg.style.color = '#ef5350';
+  }
+  setTimeout(() => { msg.textContent = ''; }, 3000);
+}
+
+function resetConfig() {
+  setSliders({ formula: { pagerank_exp: 1.0, quality_exp: 1.0, smallweb_exp: 1.0, taste_weight: 0.5, fetched_boost: 0.2 } });
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector('.preset-btn').classList.add('active');
+  scheduleRescore();
 }
 
 // ── Init ──
